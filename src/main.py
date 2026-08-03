@@ -19,7 +19,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import get_config
 from hotkey import get_hotkey
-from logger import get_logger
+from logger import (
+    get_logger,
+    install_crash_handler,
+    register_tk_error,
+    log_startup_banner,
+)
 from pill import PillBubble
 from gui import SettingsWindow  # 预导入：让 PyInstaller 在启动时即解开依赖，避免首次打开设置卡顿
 import tray as tray_mod
@@ -28,6 +33,11 @@ import tray as tray_mod
 # transcriber/faster_whisper）全部改为"用到才 import"，云端模式启动零负担。
 
 log = get_logger("yurun")
+
+# 尽早安装全局崩溃捕获：后续任何 import 失败 / 子线程崩 / Tk 报错都写进日志，
+# 用户把日志文件发回即可反馈问题。
+install_crash_handler()
+log_startup_banner()
 
 APP_TITLE = "语润 Yurun"
 
@@ -43,6 +53,8 @@ class App:
 
         self.root = tk.Tk()
         self.root.withdraw()
+        # Tk 回调异常也写进日志（崩溃可反馈）
+        register_tk_error(self.root)
         self.indicator = PillBubble(self.root)
 
         self.tray = tray_mod.Tray(

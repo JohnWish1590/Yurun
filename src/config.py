@@ -6,6 +6,9 @@ import os
 import sys
 from pathlib import Path
 
+from logger import get_logger
+log = get_logger("yurun.config")
+
 APP_NAME = "Yurun"
 
 def app_data_dir() -> Path:

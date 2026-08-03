@@ -19,6 +19,8 @@ import time
 import uuid
 
 import websocket
+from logger import get_logger
+log = get_logger("yurun.sauc")
 
 # ---- 协议常量 ----
 PROTOCOL_VERSION = 0b0001

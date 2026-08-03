@@ -8,6 +8,9 @@ import ctypes.wintypes as wt
 import threading
 import time
 
+from logger import get_logger
+log = get_logger("yurun.hotkey")
+
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 

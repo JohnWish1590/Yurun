@@ -4,6 +4,14 @@
 
 ---
 
+## [0.1.1] — 2026-08-03 · 日志与崩溃反馈（强制可反馈）
+
+- **全局崩溃捕获**：`logger.install_crash_handler()` 注册 `sys.excepthook` + `threading.excepthook` + Tk `report_callback_exception`，**任何未捕获异常（主线程 / 子线程 / 界面回调）都写入 `yurun.log`**，并附 `请将以上日志发给开发者反馈问题`。解决了「程序崩了只闪黑框、别人无法反馈」的问题。
+- **启动 banner**：每次启动写入版本 / Python / 平台 / 日志目录，便于定位环境。
+- **所有模块接入 logger**：`hotkey / refiner / sauc_asr / recorder / config / gui` 全部统一写 `%APPDATA%\Yurun\logs\yurun.log`（此前仅 main / pill 有日志）。
+- **托盘「打开日志目录」菜单项**：右键托盘 → 打开日志目录，直接定位 `yurun.log` 发给开发者。
+- **日志路径固定**：`%APPDATA%\Yurun\logs\yurun.log`（程序名恒为 `Yurun`），自动轮转（≤1MB × 3 份）。
+
 ## [0.1.0] — 2026-08-03 · 首次整理开源
 
 **功能 / 体验**

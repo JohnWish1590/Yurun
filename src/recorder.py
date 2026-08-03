@@ -6,6 +6,9 @@
 import sys
 import time
 
+from logger import get_logger
+log = get_logger("yurun.recorder")
+
 SAMPLE_RATE = 16000
 
 

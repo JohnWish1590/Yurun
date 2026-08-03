@@ -1,10 +1,12 @@
 """语润（Yurun）托盘模块：系统托盘图标 + 菜单。
 pystray 在后台线程运行；notify 也线程安全（内部投递）。
 """
+import os
 import threading
 
 import pystray
 from PIL import Image, ImageDraw
+from logger import logs_dir
 
 
 class Tray:
@@ -28,6 +30,7 @@ class Tray:
         img = self._make_image()
         menu = pystray.Menu(
             pystray.MenuItem("打开设置", lambda: self._safe(self._on_open_settings)),
+            pystray.MenuItem("打开日志目录", lambda: self._safe(self._open_logs)),
             pystray.MenuItem("退出", lambda: self._safe(self._on_quit)),
         )
         self._icon = pystray.Icon("yurun", img, title, menu)
@@ -36,6 +39,13 @@ class Tray:
         except Exception as e:
             import sys
             sys.stderr.write(f"tray error: {e}\n")
+
+    def _open_logs(self):
+        """打开日志目录，方便用户把 yurun.log 发给开发者反馈问题。"""
+        try:
+            os.startfile(str(logs_dir()))
+        except Exception:
+            pass
 
     def _safe(self, fn):
         try:

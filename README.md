@@ -166,6 +166,24 @@ pyinstaller --clean Yurun.spec
 
 ---
 
-## 九、许可证
+## 九、日志与问题反馈
+
+程序会把**完整运行日志**写到：
+
+```
+%APPDATA%\Yurun\logs\yurun.log
+```
+
+- 日志自动轮转（单文件 ≤ 1MB，保留最近 3 份）。
+- **任何未捕获异常**（主线程 / 子线程 / 界面回调）都会**自动写入该文件**，并附上 `请将以上日志发给开发者反馈问题` 提示——你无需截图黑框。
+- 启动时会写入版本 / Python / 平台信息（banner），便于定位环境。
+- **遇到 bug 时**：右键托盘图标 → **「打开日志目录」**，把 `yurun.log` 发给我即可。
+
+> 日志目录即 `%APPDATA%\(程序名)`，程序名固定为 `Yurun`，故路径恒为
+> `C:\Users\<你>\AppData\Roaming\Yurun\logs\yurun.log`。
+
+---
+
+## 十、许可证
 
 [MIT](LICENSE) © 2026 JohnWish1590 — 基于 Cindy / dash 的开源成果派生，保留其署名与致谢。

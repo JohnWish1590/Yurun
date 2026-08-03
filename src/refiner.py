@@ -8,6 +8,9 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+from logger import get_logger
+log = get_logger("yurun.refiner")
+
 def _resource_path(*parts) -> Path:
     """兼容源码运行与 PyInstaller 打包：_MEIPASS 优先。"""
     try:

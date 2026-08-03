@@ -10,6 +10,8 @@ import tkinter.font as tkfont
 from tkinter import messagebox
 
 from config import get_config
+from logger import get_logger
+log = get_logger("yurun.gui")
 
 # ---- 苹果风格配色 ----
 BG = "#F5F5F7"

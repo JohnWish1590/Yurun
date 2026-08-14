@@ -95,8 +95,9 @@ class App:
                 # 按下热键：显示「正在录音」+ 红点呼吸
                 self.indicator.start_recording()
             elif kind == "transcribing":
-                # ASR 识别中：保持「正在录音」视觉，连贯不跳变
-                self.indicator.start_recording()
+                # 松手后、ASR 等待期间：显示「正在识别」（苹果蓝麦克风），
+                # 不再误显「正在录音」，避免"框凭空跳出来"的错觉。
+                self.indicator.show_transcribing()
             elif kind == "refining":
                 self.indicator.show_refining()
             elif kind in ("done", "fallback"):

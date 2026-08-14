@@ -115,8 +115,8 @@ class App:
             elif kind == "paste":
                 self._do_paste(evt[1], hide=(evt[2] if len(evt) > 2 else True))
             elif kind == "replace_paste":
-                # 润色完成，原地替换已粘贴原文（清剪切板再粘贴新版），随后收尾。
-                self._do_paste(evt[1])
+                # 润色完成：撤销刚贴的原文再粘贴润色版（替换，不重复），随后收尾。
+                self._do_paste(evt[1], hide=True, replace=True)
         except Exception as e:
             log.exception("UI 事件处理失败: %s", e)
 
@@ -249,25 +249,49 @@ class App:
         self._after_transcribe(text, round_id=round_id)
 
     def _after_transcribe(self, text, round_id=None):
-        """识别成功后的共用收尾：先把原文立刻粘贴（最低延迟），润色在后台完成后再替换。"""
+        """识别成功后的共用收尾。
+
+        设计目标：原文立刻贴出（最低延迟），且仅在「润色真可能改动」时才显示
+        「正在润色」并等待后台结果；其余情况（太短跳过 / 未配置 / 模型大概率
+        返回 no_change）直接收尾隐藏，避免图标空挂 5s 的误导观感。
+        """
         log.info("识别结果: %s", text)
         if not text or not text.strip():
             self.ui_q.put(("error", "没识别到内容"))
             return
 
-        # 第一步：原文直接粘贴，用户几乎无感等待（ASR 一返回就出）。
-        # 先不隐藏 pill，保留"正在润色"指示；等后台润色结果再收尾。
+        # 第一步：原文直接粘贴（ASR 一返回就出），先不隐藏 pill。
         self.ui_q.put(("paste", text, False))
 
-        # 第二步：后台润色；润色成功且文本有变化时，用 replace_paste 原地替换，
-        # 否则保持原文不动。把一次串行网络往返从主路径里拿掉。
-        self.ui_q.put(("refining", None))
-        threading.Thread(
-            target=self._refine_and_replace, args=(text, round_id), daemon=True
-        ).start()
+        if self._refine_will_change(text):
+            # 真可能改动：显示「正在润色」并在后台润色，成功再 replace_paste。
+            self.ui_q.put(("refining", None))
+            threading.Thread(
+                target=self._refine_and_replace, args=(text, round_id), daemon=True
+            ).start()
+        else:
+            # 不会改动（太短/未配置/无自定义指令且较短）：原文即最终结果，立即收尾。
+            self.ui_q.put(("done", text))
+
+    def _refine_will_change(self, text) -> bool:
+        """预估这次润色是否可能产生改动（用于决定是否显示「正在润色」）。
+
+        返回 False 的情形：润色未启用 / 未配 key（no_api_key）、短句无自定义指令
+        （bypass_short）。这些走原文本、不等 LLM，pill 立即收尾。
+        """
+        cfg = get_config()
+        if not cfg.get("refine_enabled", True) or not cfg.get("api_key"):
+            return False
+        custom = cfg.get("custom_instructions", "") or ""
+        if not custom:
+            # 与 refiner._should_bypass_llm 同阈值：≤8 有效字符跳过
+            from refiner import content_length
+            if content_length(text) <= 8:
+                return False
+        return True
 
     def _refine_and_replace(self, text, round_id):
-        """后台润色：成功且变化 → 触发 replace_paste；否则保持原文。"""
+        """后台润色：成功且变化 → replace_paste（撤销原文后粘贴润色版）；否则保持原文。"""
         # 若已有更新的录音轮次，旧润色作废，避免回插覆盖新内容。
         if round_id is not None and round_id != self._round_seq:
             log.info("润色轮次过期（已有新录音），跳过替换")
@@ -336,11 +360,14 @@ class App:
             log.error("润色调用异常: %s", e)
             return {"ok": False, "text": text, "reason": "exception"}
 
-    def _do_paste(self, text, hide=True):
+    def _do_paste(self, text, hide=True, replace=False):
         """主线程：写剪贴板 + 模拟 Ctrl+V。
 
-        hide=True 时粘贴后隐藏 pill（终态）；hide=False 用于"先贴原文再后台润色"，
-        保留"正在润色"指示，等 replace_paste / done 事件再收尾。"""
+        - hide=True：粘贴后隐藏 pill（终态）。
+        - replace=True（replace_paste 事件）：先 Ctrl+Z 撤销刚贴的原文，再 Ctrl+V
+          粘贴润色版，确保是「替换」而非「追加」，绝不重复。
+        - hide=False：先贴原文再后台润色，保留「正在润色」指示。
+        """
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
@@ -350,17 +377,25 @@ class App:
             log.error("剪贴板写入失败: %s", e)
         try:
             import pyautogui
-            pyautogui.hotkey("ctrl", "v")
-            log.info("Ctrl+V 已发送")
+            if replace:
+                # 撤销刚粘贴的原文（Ctrl+Z），再粘贴润色版 → 原地替换
+                pyautogui.hotkey("ctrl", "z")
+                time.sleep(0.03)
+                pyautogui.hotkey("ctrl", "v")
+                log.info("Ctrl+Z+Ctr+V 已发送（替换原文）")
+            else:
+                pyautogui.hotkey("ctrl", "v")
+                log.info("Ctrl+V 已发送")
             if hide:
                 self.ui_q.put(("done", text))
         except Exception as e:
             log.warning("pyautogui 失败: %s", e)
             try:
                 import subprocess
+                ks = "^z^v" if replace else "^v"
                 subprocess.Popen(["powershell", "-Command",
                     "Add-Type -AssemblyName System.Windows.Forms; "
-                    "[System.Windows.Forms.SendKeys]::SendWait('^v')"])
+                    "[System.Windows.Forms.SendKeys]::SendWait('" + ks + "')"])
                 self.ui_q.put(("done", text))
             except Exception as e2:
                 log.error("备用粘贴失败: %s", e2)

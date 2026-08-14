@@ -174,31 +174,78 @@ def _bg_is_light(carert_x, caret_top):
         return None
 
 
+def _focus_rect():
+    """返回焦点窗口（hwndFocus）的屏幕矩形，比跟随鼠标稳得多。
+
+    通过 GetGUIThreadInfo 拿前台线程的焦点窗口；拿不到退回前台窗口矩形。
+    焦点窗口基本就是当前正在输入的输入框/编辑器，定位它就能让提示框
+    「贴」在输入区域附近，而不是跟着鼠标乱飘。
+    """
+    try:
+        fg = _user32.GetForegroundWindow()
+        if not fg:
+            return None
+        tid = _user32.GetWindowThreadProcessId(fg, None)
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if _user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            hwnd = info.hwndFocus or info.hwndActive or fg
+        else:
+            hwnd = fg
+        rc = wintypes.RECT()
+        _user32.GetWindowRect(hwnd, ctypes.byref(rc))
+        return (rc.left, rc.top, rc.right, rc.bottom)
+    except Exception:
+        return None
+
+
 def _compute_anchor():
     """计算气泡屏幕坐标 (x, y)。
 
-    设计 C：气泡中线 = caret.x + OFFSET_X；竖直浮在光标正下方 GAP。
-    caret 贴任务栏/屏底时自动翻到光标上方（兑底）。
-    兜底：屏幕底部居中。
+    定位优先级（稳定 > 跟手）：
+      1) 若有可靠 caret（I 形光标）：浮在 caret 正下方（设计 C 飘落感）。
+      2) 否则用焦点窗口矩形：贴在输入框底部居中（识別/润色态也固定此处，
+         不跟随鼠标，避免鼠标跑远了图标还飘在远处不美观）。
+      3) 再不行用前台窗口矩形。
+      4) 最后才退回鼠标位置兜底。
     """
     sw = _user32.GetSystemMetrics(0)
     sh = _user32.GetSystemMetrics(1)
-    r = _caret_screen_rect() or _foreground_rect()
-    if r:
-        l, t, rr, b = r
+
+    caret = _caret_screen_rect()
+    if caret:
+        l, t, rr, b = caret
         caret_x = l
         caret_bot = b
         caret_top = t
-        # 水平：中线 = caret.x + OFFSET_X
-        px = caret_x + OFFSET_X - W // 2
-        px = max(8, min(sw - W - 8, px))
-        # 竖直：默认光标下方 GAP；空间不足则翻到上方
+        px = max(8, min(sw - W - 8, caret_x + OFFSET_X - W // 2))
         if caret_bot + GAP + H <= sh - TASKBAR_SAFE:
             py = caret_bot + GAP
         else:
-            py = caret_top - H - GAP
-            if py < 8:
-                py = max(8, caret_bot + GAP)
+            py = max(8, caret_top - H - GAP)
+        return px, py
+
+    # 无 caret：锚定到焦点窗口（输入框），贴其底部居中，固定不跟鼠标
+    fr = _focus_rect() or _foreground_rect()
+    if fr:
+        l, t, rr, b = fr
+        cx = (l + rr) // 2
+        px = max(8, min(sw - W - 8, cx - W // 2))
+        # 优先贴在窗口底部上方；空间不够就贴顶部下方
+        if b - H - GAP >= 8:
+            py = b - H - GAP
+        elif t + GAP + H <= sh - TASKBAR_SAFE:
+            py = t + GAP
+        else:
+            py = max(8, (t + b) // 2 - H // 2)
+        return px, py
+
+    # 最后兜底：鼠标位置
+    cur = _cursor_screen_rect()
+    if cur:
+        cx = (cur[0] + cur[2]) // 2
+        px = max(8, min(sw - W - 8, cx - W // 2))
+        py = max(8, min(sh - H - 8, cur[3] + GAP))
         return px, py
     return (sw - W) // 2, sh - 90
 

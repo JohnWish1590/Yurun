@@ -187,3 +187,5 @@ pyinstaller --clean Yurun.spec
 ## 十、许可证
 
 [MIT](LICENSE) © 2026 JohnWish1590 — 基于 Cindy / dash 的开源成果派生，保留其署名与致谢。
+
+Socials: @下一站澳门. DM for inquiries.

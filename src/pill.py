@@ -19,28 +19,26 @@ from logger import get_logger
 
 _log = get_logger("yurun.pill")
 
-# 尺寸：对齐参考图 186x70 的深色胶囊（2.66:1），加高让 15px 字 + 麦克风图标呼吸
-W, H = 168, 56
-R = 26                  # 圆角半径（胶囊形，参考图大圆角）
-ICON_CX = 30            # 麦克风图标圆心 X
-ICON_CY = H // 2
-ICON_R = 14             # 麦克风头半径（胶囊圆角内）
-TEXT_X = 56             # 文字起点 X（图标右侧间距）
+# 尺寸：宽度只装得下"正在润色"4 字 + 圆点，高度加高让 15px 字呼吸
+W, H = 132, 50
+R = 24                  # 圆角半径（胶囊形）
+DOT_R = 6               # 录音红点半径
+DOT_X = 18              # 红点圆心 X
+SPIN_R = 9              # 转圈半径
+SPIN_X = 18             # 转圈圆心 X
+TEXT_X = 36             # 文字起点 X（圆点右侧留 18px 间距）
 GAP = 10                # 气泡与光标垂直间隙（px）
 OFFSET_X = 48           # 设计 C：气泡中线相对 caret.x 的水平偏移（飘落感）
 TASKBAR_SAFE = 56       # 屏底预留给任务栏的安全高度（px）
 
-# 主题配色（对齐参考图 Cindy 深色胶囊）
-BG_DARK = "#0d1117"     # 参考图 (13,17,23)
-TEXT_DARK = "#e6edf3"   # 参考图亮白冷色 (230,237,243)
-SPIN_DARK = "#9ecbff"   # 苹果风蓝（润色/识别高亮）
-BORDER_DARK = "#1c232c" # 深色主题细描边（比背景略亮，做出立体边）
-MIC_RED = "#ff453a"     # 录音态：苹果红（醒目）
-MIC_BLUE = "#0a84ff"    # 识别/润色态：苹果蓝（iOS 系统蓝）
-GLOW = "#2b6fff"        # 图标柔光晕（醒目）
+# 主题配色
+BG_DARK = "#0a0a0a"
+TEXT_DARK = "#F2F2F2"
+SPIN_DARK = "#CFCFCF"
+BORDER_DARK = BG_DARK   # 深色主题无边（用同色隐藏）
 BG_LIGHT = "#f7f7f7"
-TEXT_LIGHT = "#1d1d1f"  # 苹果近黑
-SPIN_LIGHT = "#0a84ff"
+TEXT_LIGHT = "#222222"
+SPIN_LIGHT = "#666666"
 BORDER_LIGHT = "#dcdcdc"  # 浅色主题加细边框，白底上才看得见
 
 TRANSPARENT = "#0d0d0d"  # 用于去四角的透明色（避免与主题色冲突）
@@ -174,40 +172,12 @@ def _bg_is_light(carert_x, caret_top):
         return None
 
 
-def _focus_rect():
-    """返回焦点窗口（hwndFocus）的屏幕矩形，比跟随鼠标稳得多。
-
-    通过 GetGUIThreadInfo 拿前台线程的焦点窗口；拿不到退回前台窗口矩形。
-    焦点窗口基本就是当前正在输入的输入框/编辑器，定位它就能让提示框
-    「贴」在输入区域附近，而不是跟着鼠标乱飘。
-    """
-    try:
-        fg = _user32.GetForegroundWindow()
-        if not fg:
-            return None
-        tid = _user32.GetWindowThreadProcessId(fg, None)
-        info = _GUITHREADINFO()
-        info.cbSize = ctypes.sizeof(info)
-        if _user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
-            hwnd = info.hwndFocus or info.hwndActive or fg
-        else:
-            hwnd = fg
-        rc = wintypes.RECT()
-        _user32.GetWindowRect(hwnd, ctypes.byref(rc))
-        return (rc.left, rc.top, rc.right, rc.bottom)
-    except Exception:
-        return None
-
-
 def _compute_anchor():
     """计算气泡屏幕坐标 (x, y)。
 
-    定位优先级（稳定 > 跟手）：
-      1) 若有可靠 caret（I 形光标）：浮在 caret 正下方（设计 C 飘落感）。
-      2) 否则用焦点窗口矩形：贴在输入框底部居中（识別/润色态也固定此处，
-         不跟随鼠标，避免鼠标跑远了图标还飘在远处不美观）。
-      3) 再不行用前台窗口矩形。
-      4) 最后才退回鼠标位置兜底。
+    设计 C：气泡中线 = caret.x + OFFSET_X；竖直浮在光标正下方 GAP。
+    caret 贴任务栏/屏底时自动翻到光标上方（兑底）。
+    兜底：屏幕底部居中。
     """
     sw = _user32.GetSystemMetrics(0)
     sh = _user32.GetSystemMetrics(1)
@@ -231,7 +201,6 @@ def _compute_anchor():
         l, t, rr, b = fr
         cx = (l + rr) // 2
         px = max(8, min(sw - W - 8, cx - W // 2))
-        # 优先贴在窗口底部上方；空间不够就贴顶部下方
         if b - H - GAP >= 8:
             py = b - H - GAP
         elif t + GAP + H <= sh - TASKBAR_SAFE:
@@ -240,7 +209,6 @@ def _compute_anchor():
             py = max(8, (t + b) // 2 - H // 2)
         return px, py
 
-    # 最后兜底：鼠标位置
     cur = _cursor_screen_rect()
     if cur:
         cx = (cur[0] + cur[2]) // 2
@@ -248,6 +216,26 @@ def _compute_anchor():
         py = max(8, min(sh - H - 8, cur[3] + GAP))
         return px, py
     return (sw - W) // 2, sh - 90
+
+
+def _focus_rect():
+    """焦点窗口矩形（比跟随鼠标稳）：用于无 caret 时锚定输入框。"""
+    try:
+        fg = _user32.GetForegroundWindow()
+        if not fg:
+            return None
+        tid = _user32.GetWindowThreadProcessId(fg, None)
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if _user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            hwnd = info.hwndFocus or info.hwndActive or fg
+        else:
+            hwnd = fg
+        rc = wintypes.RECT()
+        _user32.GetWindowRect(hwnd, ctypes.byref(rc))
+        return (rc.left, rc.top, rc.right, rc.bottom)
+    except Exception:
+        return None
 
 
 # 活动态硬超时（秒）：一旦超过立即强制报错退出，杜绝 indicator 卡死
@@ -307,21 +295,18 @@ class PillBubble:
         self._bg_border = _round_rect_items(self.canvas, 0, 0, W, H, R, BORDER_DARK)
         self._bg_fill = _round_rect_items(self.canvas, 1, 1, W - 2, H - 2, R - 1, BG_DARK)
 
-        # 苹果风麦克风图标（矢量绘制）：左侧柔光晕 + 胶囊头 + 支架 + 底座弧
-        self._glow = self.canvas.create_oval(0, 0, 0, 0, fill=GLOW, outline="")
-        self.mic_head = self.canvas.create_arc(0, 0, 0, 0, start=200, extent=140,
-                                               style="pieslice", outline="")
-        self.mic_inner = self.canvas.create_arc(0, 0, 0, 0, start=200, extent=140,
-                                                 style="pieslice", outline="")
-        self.mic_stem = self.canvas.create_rectangle(0, 0, 0, 0, fill="", outline="")
-        self.mic_base = self.canvas.create_arc(0, 0, 0, 0, start=20, extent=140,
-                                                style="arc", outline="", width=2.4)
-        self._draw_mic(MIC_RED)  # 初始录音红
-
+        self.dot = self.canvas.create_oval(
+            DOT_X - DOT_R, H // 2 - DOT_R, DOT_X + DOT_R, H // 2 + DOT_R,
+            fill="#E53935", outline="")
+        self.spinner = self.canvas.create_arc(
+            SPIN_X - SPIN_R, H // 2 - SPIN_R, SPIN_X + SPIN_R, H // 2 + SPIN_R,
+            start=0, extent=270, style="arc",
+            outline=SPIN_DARK, width=2.4)
         self.text = self.canvas.create_text(
             TEXT_X, H // 2, anchor="w",
             text="", fill=TEXT_DARK, font=FONT)
-        self.canvas.itemconfig(self._glow, state="hidden")
+        self.canvas.itemconfig(self.dot, state="hidden")
+        self.canvas.itemconfig(self.spinner, state="hidden")
 
     # ============ 公共接口（主线程调用） ============
     def _apply_theme(self, light):
@@ -329,14 +314,15 @@ class PillBubble:
             return
         self._light = light
         if light:
-            fill, txt, border = BG_LIGHT, TEXT_LIGHT, BORDER_LIGHT
+            fill, txt, spin, border = BG_LIGHT, TEXT_LIGHT, SPIN_LIGHT, BORDER_LIGHT
         else:
-            fill, txt, border = BG_DARK, TEXT_DARK, BORDER_DARK
+            fill, txt, spin, border = BG_DARK, TEXT_DARK, SPIN_DARK, BORDER_DARK
         for it in self._bg_fill:
             self.canvas.itemconfig(it, fill=fill)
         for it in self._bg_border:
             self.canvas.itemconfig(it, fill=border)
         self.canvas.itemconfig(self.text, fill=txt)
+        self.canvas.itemconfig(self.spinner, outline=spin)
 
     def _enter(self, state):
         self._state = state
@@ -368,30 +354,19 @@ class PillBubble:
         self._hide_after = AUTO_HIDE["guide"]
 
     def start_recording(self):
-        """按下热键：显示「● 正在录音」，苹果红麦克风呼吸 + 柔光晕。"""
+        """按下热键 / ASR 识别中：均显示「● 正在录音」，保持视觉连贯。"""
         self._enter("recording")
-        self._set_icon("mic")
-        self._draw_mic(MIC_RED)
+        self._set_icon("dot")
         self.canvas.itemconfig(self.text, text="正在录音", font=FONT)
         self.canvas.coords(self.text, TEXT_X, H // 2)
         self._dot_pulse = 0.0
 
-    def show_transcribing(self):
-        """松手后 ASR 等待：显示「正在识别」，苹果蓝麦克风常亮。"""
-        self._enter("transcribing")
-        self._set_icon("mic")
-        self._draw_mic(MIC_BLUE)
-        self.canvas.itemconfig(self.text, text="正在识别", font=FONT)
-        self.canvas.coords(self.text, TEXT_X, H // 2)
-
     def show_refining(self):
-        """LLM 润色中：显示「正在润色」，苹果蓝麦克风脉动。"""
+        """LLM 润色中：显示「⟳ 正在润色」。"""
         self._enter("refining")
-        self._set_icon("mic")
-        self._draw_mic(MIC_BLUE)
+        self._set_icon("spinner")
         self.canvas.itemconfig(self.text, text="正在润色", font=FONT)
         self.canvas.coords(self.text, TEXT_X, H // 2)
-        self._spin = 0
 
     def show_error(self, msg="出错了"):
         self._enter("error")
@@ -448,45 +423,8 @@ class PillBubble:
             _log.debug("pill 重定位: (%d,%d) -> (%d,%d)", cur[0], cur[1], new[0], new[1])
 
     def _set_icon(self, which):
-        show = which == "mic"
-        for it in (self._glow, self.mic_head, self.mic_inner, self.mic_stem, self.mic_base):
-            self.canvas.itemconfig(it, state="normal" if show else "hidden")
-
-    def _draw_mic(self, color, glow=0.5, scale=1.0):
-        """绘制苹果风麦克风图标（矢量）。color=主体色；glow=0..1 光晕强度。"""
-        cx, cy = ICON_CX, ICON_CY
-        r = ICON_R * scale
-        # 光晕（半透明大圆，营造醒目感）
-        gr = r + 8 + 6 * glow
-        gx0, gy0, gx1, gy1 = cx - gr, cy - gr, cx + gr, cy + gr
-        try:
-            self.canvas.coords(self._glow, gx0, gy0, gx1, gy1)
-            self.canvas.itemconfig(self._glow, fill=GLOW,
-                                   stipple="gray25" if glow < 0.95 else "")
-            self.canvas.itemconfig(self._glow, state="normal")
-        except Exception:
-            pass
-        # 麦克风头（圆角胶囊）：
-        head_w = r * 1.05
-        hx0, hy0, hx1, hy1 = cx - head_w / 2, cy - r, cx + head_w / 2, cy + r * 0.18
-        # 用圆角矩形近似胶囊头（create_arc 拼）
-        self.canvas.coords(self.mic_head, hx0, hy0, hx1, hy1 + head_w)
-        self.canvas.itemconfig(self.mic_head, start=180, extent=180,
-                                style="pieslice", fill=color, outline="")
-        # 内侧高光（更亮的同色，做立体）
-        self.canvas.coords(self.mic_inner, hx0 + 2, hy0 + 2, hx1 - 2, hy1 - 2 + head_w)
-        self.canvas.itemconfig(self.mic_inner, start=180, extent=180,
-                                style="pieslice", fill="#ffffff", stipple="gray25", outline="")
-        # 支架（竖直杆）
-        stem_w = max(3, r * 0.18)
-        sx0, sy0, sx1, sy1 = cx - stem_w / 2, cy + r * 0.1, cx + stem_w / 2, cy + r * 0.75
-        self.canvas.coords(self.mic_stem, sx0, sy0, sx1, sy1)
-        self.canvas.itemconfig(self.mic_stem, fill=color, outline="")
-        # 底座弧（麦克风支架的 U 形）
-        bw = r * 0.95
-        self.canvas.coords(self.mic_base, cx - bw, cy + r * 0.55, cx + bw, cy + r * 0.55 + bw)
-        self.canvas.itemconfig(self.mic_base, start=20, extent=140,
-                                style="arc", outline=color, width=max(2, r * 0.18))
+        self.canvas.itemconfig(self.dot, state="hidden" if which != "dot" else "normal")
+        self.canvas.itemconfig(self.spinner, state="hidden" if which != "spinner" else "normal")
 
     def _center_text(self):
         try:
@@ -510,18 +448,16 @@ class PillBubble:
             return
 
         if self._state == "recording":
-            # 红点呼吸 + 柔光晕脉动
             self._dot_pulse += 0.18
-            k = 0.5 + 0.5 * math.sin(self._dot_pulse)
-            self._draw_mic(MIC_RED, glow=0.35 + 0.45 * k, scale=1.0 + 0.06 * k)
-        elif self._state == "transcribing":
-            # 蓝麦克风常亮，光晕轻微呼吸
-            self._draw_mic(MIC_BLUE, glow=0.5)
-        elif self._state == "refining":
-            # 蓝麦克风脉动（自转光晕感）
-            self._spin = (self._spin + 10) % 360
-            k = 0.5 + 0.5 * math.sin(math.radians(self._spin))
-            self._draw_mic(MIC_BLUE, glow=0.4 + 0.4 * k)
+            r = DOT_R + 1.4 * (0.5 + 0.5 * math.sin(self._dot_pulse))
+            self.canvas.coords(
+                self.dot,
+                DOT_X - r, H // 2 - r, DOT_X + r, H // 2 + r,
+            )
+
+        if self._state == "refining":
+            self._spin = (self._spin + 12) % 360
+            self.canvas.itemconfig(self.spinner, start=self._spin)
 
         # 轻量重定位：录音/润色中每 800ms 抓一次 caret，偏差 > 60px 才更新
         # （避免每次 rcCaret 抖动都触发；用户切换窗口/输入框也能跟到）

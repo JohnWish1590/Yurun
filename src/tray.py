@@ -18,12 +18,26 @@ class Tray:
 
     @staticmethod
     def _make_image(size=64):
+        """精致麦克风图标：胶囊头 + 支架 + U 形底座，亮色描边、干净不花哨。"""
         img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        # 麦克风：蓝色圆 + 白点
-        d.ellipse([8, 8, size - 8, size - 8], fill=(0, 120, 255, 255))
-        d.ellipse([size//2 - 6, size//2 - 6, size//2 + 6, size//2 + 6],
-                  fill=(255, 255, 255, 255))
+        cx = size // 2
+        # 麦克风头（圆角竖胶囊）
+        head_w = size * 0.34
+        head_top = size * 0.16
+        head_bot = size * 0.52
+        d.rounded_rectangle(
+            [cx - head_w / 2, head_top, cx + head_w / 2, head_bot],
+            radius=head_w / 2, fill=(65, 105, 225, 255),
+            outline=(173, 200, 255, 255), width=max(2, size // 32))
+        # 支架（竖直杆）
+        stem_w = max(3, size * 0.07)
+        d.rectangle([cx - stem_w / 2, head_bot - 2, cx + stem_w / 2, size * 0.70],
+                    fill=(173, 200, 255, 255))
+        # 底座弧（U 形支架）
+        bw = size * 0.30
+        d.arc([cx - bw, size * 0.62, cx + bw, size * 0.62 + bw],
+              start=20, end=160, fill=(173, 200, 255, 255), width=max(3, size // 22))
         return img
 
     def start(self, title="语润 Yurun"):

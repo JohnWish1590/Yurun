@@ -2,11 +2,33 @@
 pystray 在后台线程运行；notify 也线程安全（内部投递）。
 """
 import os
+import sys
 import threading
+from pathlib import Path
 
 import pystray
 from PIL import Image, ImageDraw
 from logger import logs_dir
+
+# 在模块加载时解析图标路径（避免 @staticmethod 内 __file__ 作用域歧义）
+def _resolve_icon():
+    try:
+        if getattr(sys, "frozen", False):
+            base = getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
+        else:
+            base = Path(__file__).resolve().parent
+        cands = [
+            Path(base).parent / "assets" / "icon.ico",
+            Path(base) / "assets" / "icon.ico",
+        ]
+        for c in cands:
+            if c.exists():
+                return str(c)
+    except Exception:
+        pass
+    return None
+
+ASSETS_ICON = _resolve_icon()
 
 
 class Tray:
@@ -17,31 +39,35 @@ class Tray:
         self._lock = threading.Lock()
 
     @staticmethod
+    def _icon_path():
+        """返回 favicon.ico 的绝对路径（开发/打包两种模式）。"""
+        return ASSETS_ICON
+
+    @staticmethod
     def _make_image(size=64):
         """加载项目图标 assets/icon.ico（favicon，含多尺寸 + 透明）。"""
         try:
-            # 开发模式：src/../assets/icon.ico；打包后：_MEIPASS/assets/icon.ico
-            if getattr(sys, "frozen", False):
-                base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-            else:
-                base = os.path.dirname(os.path.abspath(__file__))
-            ico = os.path.join(base, "..", "assets", "icon.ico")
-            if not os.path.exists(ico):
-                ico = os.path.join(base, "assets", "icon.ico")
-            img = Image.open(ico)
-            img = img.convert("RGBA").resize((size, size), Image.LANCZOS)
-            return img
+            ico = Tray._icon_path()
+            if ico:
+                img = Image.open(ico).convert("RGBA").resize((size, size), Image.LANCZOS)
+                return img
         except Exception:
-            return Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            pass
+        return Image.new("RGBA", (size, size), (0, 0, 0, 0))
 
     def start(self, title="语润 Yurun"):
         img = self._make_image()
+        ico_path = Tray._icon_path()
         menu = pystray.Menu(
             pystray.MenuItem("打开设置", lambda: self._safe(self._on_open_settings)),
             pystray.MenuItem("打开日志目录", lambda: self._safe(self._open_logs)),
             pystray.MenuItem("退出", lambda: self._safe(self._on_quit)),
         )
-        self._icon = pystray.Icon("yurun", img, title, menu)
+        # 优先用 ico 文件路径交给 pystray 原生处理多尺寸；失败则退回 PIL Image
+        try:
+            self._icon = pystray.Icon("yurun", icon=ico_path, title=title, menu=menu)
+        except Exception:
+            self._icon = pystray.Icon("yurun", img, title, menu)
         try:
             self._icon.run()
         except Exception as e:

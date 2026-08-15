@@ -460,9 +460,7 @@ class App:
         threading.Thread(target=self.tray.start, daemon=True).start()
         # 后台预热重依赖，避免首次按下热键才现场加载 numpy/sounddevice/websocket/pyautogui
         threading.Thread(target=self._warmup, daemon=True).start()
-        # 主循环
-        # 首次启动引导一次（窄气泡提示快捷键），3.5s 后自动淡出
-        self.root.after(600, lambda: self.ui_q.put(("guide", None)))
+        # 主循环（不再弹首次启动引导气泡，避免文字显示不全的干扰）
         self.root.after(40, self.pump)
         self.root.mainloop()
 

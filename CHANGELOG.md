@@ -167,3 +167,54 @@ oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首
 - [ ] GitHub Actions 自动打包 EXE + Inno Setup（Windows Runner）。
 - [ ] 可选流式输出（首字仍受服务端 TTFT 限制，仅改善体感）。
 - [ ] 更小更准的本地蒸馏模型适配。
+
+
+---
+
+## 交接说明（2026-08-16 · 由 Cindy AI 整理）
+
+> 给后续接手者（其他 agent / 同事）的总览：已做、已验证、未解决。本仓库无 .git（仅 .gitignore），改动以本地提交存在（git log 可见），尚未推远程。
+
+### 一、已完成改动（按版本）
+
+| 版本 | 日期 | 内容 | 涉及文件 |
+|------|------|------|----------|
+| 0.1.2 | 08-14 | 润色后台异步：原文先贴、后台润色再 replace_paste；_round_seq 轮次守卫；SAUC 识别耗时日志；去 _do_paste 的 sleep | main.py |
+| 0.1.3 | 08-14 | 三态标签时序(录音→识别→润色)；润色收尾(短句/未改动立即收尾)；replace_paste 用 Ctrl+Z 撤销再粘贴(防重复)；提示框锚定焦点窗口(不再跟鼠标)；录音药丸回退原版红点+转圈；托盘换绘制麦克风；修 caret None 日志崩溃 | main.py, pill.py, tray.py |
+| 0.1.4 | 08-15 | 统一图标：程序/exe/任务栏/设置窗 全用 favicon.ico(16/32/48/64+透明)；Yurun.spec 打包 assets；托盘 _MEIPASS 容错 | assets/icon.ico, Yurun.spec, tray.py, gui.py |
+| 0.1.5 | 08-15 | 移除启动引导气泡；修复任务栏图标不显示(根因 @staticmethod 内 __file__ 作用域歧义致 _icon_path 返回 None，改为模块加载时解析 ASSETS_ICON 常量) | main.py, tray.py |
+
+### 二、已验证
+
+- 异步润色三态(短句/长句ok/长句no_change)单测通过。
+- 焦点窗口定位函数可调用。
+- 打包后 _MEIPASS/assets/icon.ico 运行时存在；托盘路径可解析(开发模式 ASSETS_ICON 指向 assets/icon.ico 且 exists)。
+- dist/Yurun.exe 可生成(约68MB onefile)。
+
+### 三、当前未解决 / 用户最新反馈(08-16，需接手)
+
+1. 程序启动即失败：用户报告一允许就跳 注册热键失败，且启动气泡还是显示不全(应已移除，可能旧 exe 缓存或打包未生效)。
+2. 任务栏图标仍不显示：尽管 0.1.5 修了路径解析，实测感觉没运行成功，托盘图标依旧缺失。怀疑 pystray 打包环境仍有静默异常(原 except 吞错)或 explorer 缓存。
+3. 以上两点均未在代码中定位确定根因，只按现象改过；需接手者实际跑 dist/Yurun.exe 看 %APPDATA%\Yurun\logs\yurun.log 真实报错。
+
+### 四、关键排查入口
+
+- 热键注册失败：看 src/hotkey.py 的 RegisterHotKey 分支(错误码/是否被占用) 及 main.py 里 hotkey.start() 返回值。
+- 任务栏图标：src/tray.py 的 ASSETS_ICON 常量、start() 里 pystray.Icon(icon=ico_path)；建议临时把 start() 的 except 打印到日志确认 pystray 是否抛错。
+- 启动气泡：main.py 已删 after(600, guide)，若仍出现必是运行了旧 exe；确认 dist/Yurun.exe 是最新打包(py -3 -m PyInstaller Yurun.spec --clean --noconfirm)。
+- 日志位置：%APPDATA%\Yurun\logs\yurun.log（崩溃/异常都写这里，首要排查源）。
+
+### 五、打包命令
+
+    cd D:\SynologyDrive\CODING\yurun-stream
+    py -3 -m PyInstaller Yurun.spec --clean --noconfirm
+    # 产物 dist/Yurun.exe (onefile，内联 prompts/ 与 assets/)
+
+依赖：Python 3.12 + PyInstaller 6.x；requirements.txt 列出全部运行时依赖。
+
+### 六、紧急待办
+
+- [ ] 修复启动 注册热键失败(最高优先级，程序目前打不开)。
+- [ ] 确认/修复任务栏托盘图标在打包环境下真实显示。
+- [ ] 确认启动气泡彻底移除(排除旧 exe 缓存)。
+- [ ] 把仓库推到 GitHub(当前无远程，本地提交未同步)。

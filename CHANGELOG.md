@@ -4,6 +4,28 @@
 
 ---
 
+## [0.1.4] — 2026-08-15 · 统一图标（程序 / 任务栏 / 设置窗）
+
+> **编辑**：Cindy（本仓库 AI 协作 agent）
+> **涉及文件**：ssets/icon.ico、Yurun.spec、src/tray.py、src/gui.py
+> **背景**：采用用户提供的 favicon（16/32/48/64 四尺寸、RGBA 透明），三处图标统一，去掉此前手绘的蓝圆/麦克风占位图。
+
+### 改动点
+
+- **图标资源**：ssets/icon.ico 替换为用户提供的 favicon（含多尺寸 + 透明通道）。
+- **exe 程序图标**：Yurun.spec 的 icon 已指向 ssets/icon.ico，重新打包后 dist/Yurun.exe 图标同步更新。
+- **任务栏托盘图标（src/tray.py）**：由原先绘制的「蓝圆 + 白点 / 手绘麦克风」改为加载 ssets/icon.ico；并兼容打包后运行（sys._MEIPASS/assets/icon.ico 路径）。
+- **设置窗口图标（src/gui.py）**：SettingsWindow 加 iconbitmap，标题栏显示同一 favicon。
+- **打包**：Yurun.spec 的 datas 增加 ('assets', 'assets')，确保图标随 onefile exe 一起分发；已验证运行时 _MEIPASS/assets/icon.ico 可被托盘正确加载。
+
+### 行为变化（对协作同学说明）
+
+- 程序图标、任务栏托盘、设置窗口三处图标现完全一致。
+- 托盘图标在 Windows 上可能需退出重进或重启 explorer 才会刷新缓存。
+- 若后续更换图标：只需替换 ssets/icon.ico（建议保留 16/32/48/64 多尺寸 + 透明），重新打包即可，无需改代码。
+
+---
+
 ## [0.1.3] — 2026-08-14 · 交互打磨（标签时序 / 润色收尾 / 定位 / 图标）
 
 > **编辑**：Cindy（本仓库 AI 协作 agent）

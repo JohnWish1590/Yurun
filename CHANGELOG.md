@@ -4,6 +4,30 @@
 
 ---
 
+## [0.1.5] — 2026-08-15 · 去除启动气泡 + 修复任务栏图标
+
+> **编辑**：Cindy（本仓库 AI 协作 agent）
+> **涉及文件**：src/main.py、src/tray.py
+> **背景**：用户反馈①启动时弹出「按住 \ 键 说话」引导气泡，文字显示不全、多余；②运行时任务栏无任何图标。
+
+### 改动点
+
+- **移除启动引导气泡（src/main.py）**：删除 
+un() 里 
+oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首次引导。
+- **修复任务栏图标不显示（src/tray.py）**：
+  - 根因：原 _icon_path 在 @staticmethod 内用 os.path.abspath(__file__) 解析图标路径，存在作用域歧义导致返回 None，托盘静默降级为透明、不显示。
+  - 改为**模块加载时**即用 Path(__file__).resolve() 解析并缓存为 ASSETS_ICON 常量，开发/打包（_MEIPASS）两种模式都正确。
+  - start() 用 pystray.Icon(icon=<ico路径>) 原生加载多尺寸 favicon，不再传 PIL Image。
+
+### 验证
+
+- 开发模式 ASSETS_ICON 解析为 ssets/icon.ico（exists=True，64x64 RGBA）。
+- 打包后运行时 _MEIPASS/assets/icon.ico 存在，托盘可加载。
+- 启动不再弹引导气泡。
+
+---
+
 ## [0.1.4] — 2026-08-15 · 统一图标（程序 / 任务栏 / 设置窗）
 
 > **编辑**：Cindy（本仓库 AI 协作 agent）

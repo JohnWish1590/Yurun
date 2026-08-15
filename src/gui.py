@@ -178,6 +178,14 @@ class SettingsWindow:
         self.root.title("语润 Yurun · 设置")
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
+        # 设置窗口图标（与程序/任务栏一致：assets/icon.ico）
+        try:
+            import os
+            _ico = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "assets", "icon.ico")
+            self.root.iconbitmap(_ico)
+        except Exception:
+            pass
         self.root.withdraw()   # 先藏起来：建完界面、刷完渲染再显示，避免"打开后点不动"的假死窗口期
 
         self._var = {}

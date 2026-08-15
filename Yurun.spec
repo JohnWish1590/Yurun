@@ -5,7 +5,7 @@ a = Analysis(
     ['src\\main.py'],
     pathex=[],
     binaries=[],
-    datas=[('prompts', 'prompts')],
+    datas=[('prompts', 'prompts'), ('assets', 'assets')],
     hiddenimports=['sounddevice', 'soundfile', 'websocket', 'pyautogui', 'pynput.keyboard._win32', 'pystray._win32', 'PIL._tkinter_finder'],
     hookspath=[],
     hooksconfig={},

@@ -190,20 +190,14 @@ pyinstaller --clean Yurun.spec
 
 [MIT](LICENSE) © 2026 JohnWish1590 — 基于 Cindy / dash 的开源成果派生，保留其署名与致谢。
 
----
+## 仓库链接
 
-📦 源码 / Issues / Releases：https://github.com/JohnWish1590/Yurun
-
-🐛 问题反馈：GitHub Issues
-
-📝 变更历史：CHANGELOG.md
-
-🚀 发布说明规范：RELEASE.md
-
-⚡ 快速开始（部署细节）：docs/QUICKSTART.md
-
-🔒 隐私政策：PRIVACY.md
-
-🏪 上架清单（未来）：STORE_GUIDE.md
+- 📦 源码 / Issues / Releases：https://github.com/JohnWish1590/Yurun
+- 🐛 问题反馈：[GitHub Issues](https://github.com/JohnWish1590/Yurun/issues)
+- 📝 变更历史：[CHANGELOG.md](CHANGELOG.md)
+- 🚀 发布说明规范：[RELEASE.md](RELEASE.md)
+- ⚡ 快速开始（部署细节）：[docs/QUICKSTART.md](docs/QUICKSTART.md)
+- 🔒 隐私政策：[PRIVACY.md](PRIVACY.md)
+- 🏪 上架清单（未来）：[STORE_GUIDE.md](STORE_GUIDE.md)
 
 Socials: @下一站澳门. DM for inquiries.

@@ -1,9 +1,5 @@
 # 语润 Yurun · 全局语音润色输入悬浮工具
 
-<p align="center">
-  <img src="assets/icon.png" width="96" alt="语润 Yurun 图标">
-</p>
-
 一个 **Windows 全局** 的语音转写 + AI 润色输入工具：按住热键说话，松手后自动转写、用大模型润色，再把润色后的文本**直接填进当前光标所在的输入框**（WorkBuddy、微信、浏览器、编辑器等任意软件）。
 
 > **致敬声明 (Tribute)**
@@ -193,3 +189,14 @@ pyinstaller --clean Yurun.spec
 ## 十、许可证
 
 [MIT](LICENSE) © 2026 JohnWish1590 — 基于 Cindy / dash 的开源成果派生，保留其署名与致谢。
+
+---
+
+📦 源码 / Issues / Releases：https://github.com/JohnWish1590/Yurun
+🐛 问题反馈：GitHub Issues
+📝 变更历史：CHANGELOG.md
+🚀 发布说明规范：RELEASE.md
+⚡ 快速开始（部署细节）：docs/QUICKSTART.md
+🔒 隐私政策：PRIVACY.md
+🏪 上架清单（未来）：STORE_GUIDE.md
+Socials: @下一站澳门. DM for inquiries.

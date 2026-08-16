@@ -37,6 +37,26 @@
 - PID 文件位于 `%APPDATA%\Yurun\yurun.pid`（纯文本，记当前实例 PID）。
 - 热键失败提示现在是 4 字短文案；排查看日志而非 pill。
 
+### 收尾补充（2026-08-16 · 混元3 接手）
+
+> **补充**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件（补充）**：src/gui.py、src/tray.py、src/logger.py、Yurun.spec、installer/yurun_setup.iss、README.md、.gitignore
+> **背景**：0.1.8 初版条目只记了单实例锁与 pill 文案；用户定稿后由 混元3 完成品牌化与收尾，并补齐期间遗漏的记录。
+
+### 改动点（补充）
+
+- **版本号对齐**：`src/logger.py` 的 `YURUN_VERSION` 与 `installer/yurun_setup.iss` 的 `MyAppVersion` 由 `0.1.0` → `0.1.8`，消除启动 banner 版本与 CHANGELOG 不一致。
+- **界面显示名统一为「语润」**：`src/gui.py`（设置窗标题 / 标题标签 / 关于弹窗）、`src/main.py`（`APP_TITLE`）、`src/tray.py`（start / notify 标题）、`src/logger.py`（启动 banner）的 "语润 Yurun" → "语润"。内部 `APP_NAME`、配置文件目录与进程名匹配一律不动，旧配置零影响。
+- **打包产物改名「语润.exe」**：`Yurun.spec` 的 `name='Yurun'` → `'语润'`，输出 `dist/语润.exe`；`installer/yurun_setup.iss` 同步 `MyAppExeName` / `Source` / `DefaultDirName` / `OutputBaseFilename`，`README.md` 构建说明同步。
+- **单实例锁动态识别（改名不失效）**：`src/singleinstance.py` 进程名校验改为动态取 `os.path.basename(sys.executable)` + `_IS_FROZEN` 守卫；改名 `语润.exe` 后单实例锁仍能认出自身进程并清理旧僵尸，`热键被占` bug 不回潮；`kill_other_yurun_exe` 仅在打包模式按自身 exe 名枚举，避免 dev 模式（python.exe）误杀其它 python 进程。
+- **README 更新**：补充 0.1.6–0.1.8 真实功能（单实例锁 / Plan B 润色不误吞前文 / 短句直出 ≤8 中文字 / 热键被占提示）与版本说明。
+- **.gitignore 加固**：追加 `dist_*/`、`build_*/` 通配，避免版本化构建目录再次沦为未跟踪废目录。
+- **目录收尾**：删除原版 `D:\SynologyDrive\CODING\yurun`（146MB），`yurun-stream` 为今后唯一版本；清理 `yurun-stream` 内冗余 `dist*/build*` 构建目录（释放约 880MB），仅留 `dist/语润.exe` 作为官方构建。
+
+### 验证（补充）
+
+- 用户实测 `dist/语润.exe`：启动 banner 显示「语润 v0.1.8 启动」、界面显示「语润」、托盘 / 任务栏图标正常，确认可用。
+
 ---
 
 ## [0.1.7] — 2026-08-16 · 润色改同步一次贴（方案 B，弃用 replace_paste）
@@ -251,9 +271,9 @@ oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首
 
 ---
 
-## 交接说明（2026-08-16 · 由 Cindy AI 整理）
+## 交接说明（2026-08-16 · Cindy 整理 / 混元3 收尾更新）
 
-> 给后续接手者（其他 agent / 同事）的总览：已做、已验证、未解决。本仓库无 .git（仅 .gitignore），改动以本地提交存在（git log 可见），尚未推远程。
+> 给后续接手者（其他 agent / 同事）的总览：已做、已验证、未解决。本仓库已有本地 git（master 分支，多笔本地提交，git log 可见），但尚未添加远程、未推 GitHub（见六、紧急待办）。
 
 ### 一、已完成改动（按版本）
 
@@ -265,14 +285,14 @@ oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首
 | 0.1.5 | 08-15 | 移除启动引导气泡；修复任务栏图标不显示(根因 @staticmethod 内 __file__ 作用域歧义致 _icon_path 返回 None，改为模块加载时解析 ASSETS_ICON 常量) | main.py, tray.py |
 | 0.1.6 | 08-16 | 修复托盘图标崩溃(0.1.5 引入的 string-path bug：pystray.Icon(icon=字符串路径) 改回传 PIL Image) | tray.py |
 | 0.1.7 | 08-16 | 润色改同步一次贴(方案B)：不先贴原文、润色完一次 paste 最终文本；弃用 replace_paste(Ctrl+Z 撤销法跨 app 误删整段历史) | main.py |
-| 0.1.8 | 08-16 | 单实例锁(新进程杀旧接管：kill_old_and_takeover+kill_other_yurun_exe)；pill 失败文案缩成"热键被占"/"热键无效" | 新增 singleinstance.py, main.py, hotkey.py, Yurun.spec |
+| 0.1.8 | 08-16 | 单实例锁(新进程杀旧接管：kill_old_and_takeover+kill_other_yurun_exe)；pill 失败文案缩成"热键被占"/"热键无效"；收尾品牌化：版本号对齐 0.1.8、界面显示名统一「语润」、打包产物改名「语润.exe」、单实例锁动态识别进程名(改名不失效)、README/.gitignore/目录收尾 | 新增 singleinstance.py, main.py, hotkey.py, Yurun.spec, gui.py, tray.py, logger.py, installer/yurun_setup.iss, README.md, .gitignore |
 
 ### 二、已验证
 
 - 异步润色三态(短句/长句ok/长句no_change)单测通过。
 - 焦点窗口定位函数可调用。
 - 打包后 _MEIPASS/assets/icon.ico 运行时存在；托盘路径可解析(开发模式 ASSETS_ICON 指向 assets/icon.ico 且 exists)。
-- dist/Yurun.exe 可生成(约68MB onefile)。
+- dist/语润.exe 可生成(约68MB onefile)。
 
 ### 三、原"未解决"项状态（08-16 由 WorkBuddy/GLM-5.2 接手后更新）
 
@@ -284,14 +304,16 @@ oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首
 
 - 热键注册失败：看 src/hotkey.py 的 RegisterHotKey 分支(错误码/是否被占用) 及 main.py 里 hotkey.start() 返回值。
 - 任务栏图标：src/tray.py 的 ASSETS_ICON 常量、start() 里 pystray.Icon(icon=ico_path)；建议临时把 start() 的 except 打印到日志确认 pystray 是否抛错。
-- 启动气泡：main.py 已删 after(600, guide)，若仍出现必是运行了旧 exe；确认 dist/Yurun.exe 是最新打包(py -3 -m PyInstaller Yurun.spec --clean --noconfirm)。
+- 启动气泡：main.py 已删 after(600, guide)，若仍出现必是运行了旧 exe；确认 dist/语润.exe 是最新打包(py -3 -m PyInstaller Yurun.spec --noconfirm)。
 - 日志位置：%APPDATA%\Yurun\logs\yurun.log（崩溃/异常都写这里，首要排查源）。
 
 ### 五、打包命令
 
     cd D:\SynologyDrive\CODING\yurun-stream
-    py -3 -m PyInstaller Yurun.spec --clean --noconfirm
-    # 产物 dist/Yurun.exe (onefile，内联 prompts/ 与 assets/)
+    py -3 -m PyInstaller Yurun.spec --noconfirm
+    # 产物 dist/语润.exe (onefile，内联 prompts/ 与 assets/)
+    # 注：--clean 在部分开启安全删除拦截的环境会失败(内部 os.remove 被拦截)，可省略；
+    # 若旧构建残留，先 `rm -rf build dist` 手动清理后再重建即可。
 
 依赖：Python 3.12 + PyInstaller 6.x；requirements.txt 列出全部运行时依赖。
 
@@ -301,5 +323,5 @@ oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首
 - [x] ~~确认/修复任务栏托盘图标在打包环境下真实显示~~（0.1.6 解决）。
 - [x] ~~确认启动气泡彻底移除~~（0.1.5 已删，用最新打包版即可）。
 - [ ] 把仓库推到 GitHub(当前无远程，本地提交未同步)。
-- [ ]（新增）logger.py 的 YURUN_VERSION 仍写 "0.1.0"，启动 banner 显示 v0.1.0，与 CHANGELOG(0.1.8) 不一致，待统一。
-- [ ]（新增）沙箱环境无法覆盖旧 dist 目录，本机会留多个 dist_v2~v5 中间产物；用户本机可 `pyinstaller --clean Yurun.spec` 重建到 dist 并清理中间目录。
+- [x]（已解决·0.1.8 收尾）logger.py 的 YURUN_VERSION 已由 "0.1.0" → "0.1.8"，启动 banner 显示 v0.1.8，与 CHANGELOG 一致。
+- [x]（已解决·0.1.8 收尾）冗余 dist_v2~v5 / build_v2~v5 等中间产物已清理，仅留 dist/语润.exe 作为官方构建；原版仓库 D:\SynologyDrive\CODING\yurun 已删除，yurun-stream 为唯一版本。

@@ -4,6 +4,38 @@
 
 ---
 
+## [0.1.9] — 2026-08-17 · 零剪贴板污染粘贴 + 录音90秒 + 拿掉识别/润色超时
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：新增 src/typer.py；src/main.py、src/pill.py、src/config.py、src/gui.py、src/logger.py、installer/yurun_setup.iss、Yurun.spec
+> **背景**：用户反馈两个问题：①说话超过 20–30 秒会弹出「处理超时，重试一次」提示，但润色其实正常完成（提示具有误导性）；②用完语润后 Windows 剪贴板历史（Win+V / 第三方剪贴板工具）全是语润刚贴出去的内容，原本复制的工作内容被挤掉，剪贴板功能基本没法用。经查 Cindy 源码确认：其 Windows 粘贴路径也是「写剪贴板 + Ctrl+V + 600ms 还原快照」，还原只还原「当前剪贴板内容」、不还原「历史」，所以历史污染是机制固有局限，唯一治本路径是不走剪贴板。
+
+### 改动点
+
+- **粘贴改 SendInput Unicode 逐字输入（零剪贴板污染，核心）**：新建 `src/typer.py`，用 `user32.SendInput` + `KEYEVENTF_UNICODE` 逐字符投递 Unicode 码点，**全程不碰剪贴板**。Win+V 历史一条都不多，原剪贴板内容零影响；中英文均准确（码点直传，不经过虚拟键码 / IME）。`_do_paste` 按 config 的 `insert_method` 分流：`type`（默认）走 SendInput；`paste` 走原「写剪贴板 + Ctrl+V」作兜底；SendInput 失败时自动回退剪贴板路径并记日志。
+- **设置窗加「粘贴方式」开关**：触发方式下方新增 Segmented（逐字输入 / 剪贴板），默认逐字输入；个别窗口不兼容 SendInput 时可切剪贴板。
+- **录音上限 30→90 秒**：`main.py` `max_seconds=90`，长阐述不再被截断。
+- **拿掉识别 / 润色态硬超时**：`pill.py` `STATE_TIMEOUT` 删掉 `transcribing`(25) / `refining`(25)，只保留 `recording:40` 兜底。长录音后识别 / 润色耗时再久也不再误报「处理超时」；录音态 40s 仅防录音线程异常卡死（正常 max_seconds=90 会先到，40s 兜底实际跑不到，留作异常保险）。
+- **版本号 0.1.8→0.1.9**：`logger.py` `YURUN_VERSION`、`installer/yurun_setup.iss` `MyAppVersion` 同步。
+- **打包**：`Yurun.spec` `hiddenimports` 加 `'typer'`。
+
+### 验证
+
+- 全部改动文件 `py_compile` 通过；`typer` 的 `INPUT` 结构 `sizeof=40`（64 位正确）。
+- 用系统 Python 3.12.2（装了完整运行时依赖）打包成功，`dist/语润.exe` 68.1 MB（与 v0.1.8 同量级，依赖完整）。
+- 保留 `dist/语润-v0.1.8.exe` 作回退；用户实机试用确认剪贴板历史零污染 + 长录音不再误报超时。
+- 踩坑记录：WorkBuddy 托管 Python 3.13.12 是干净环境、未装项目依赖，用它打包出来仅 28MB（缺 numpy/sounddevice 等大库 DLL）；必须用装了完整依赖的系统 Python 3.12.2 打包。
+
+### 行为变化（对协作同学说明）
+
+- 默认粘贴路径从「写剪贴板 + Ctrl+V」改为 SendInput 逐字输入；Win+V 历史不再被污染。
+- 新增 config 字段 `insert_method`（`type` / `paste`，默认 `type`）。
+- pill 不再有 `transcribing` / `refining` 硬超时；录音态 40s 兜底保留。
+- 单次录音最长 90 秒。
+- 代价：逐字输入长文本（如 200 字）约需 0.1–0.5 秒（批量 SendInput），期间输入框不能动；个别应用不接受 SendInput 时切 `paste` 模式。
+
+---
+
 ## [0.1.8] — 2026-08-16 · 单实例锁（永远只有一个进程）+ pill 失败文案修复
 
 > **编辑**：WorkBuddy（GLM-5.2，本仓库 AI 协作 agent）

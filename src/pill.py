@@ -239,10 +239,10 @@ def _focus_rect():
 
 
 # 活动态硬超时（秒）：一旦超过立即强制报错退出，杜绝 indicator 卡死
+# 注：识别/润色态不设硬超时——后台跑多久都等，不再误报「处理超时」。
+#     录音态保留 40s 兜底（录音有 max_seconds 自然终止，40s 仅防录音线程异常卡死）。
 STATE_TIMEOUT = {
     "recording": 40,
-    "transcribing": 25,
-    "refining": 25,
 }
 AUTO_HIDE = {
     "guide": 3500,

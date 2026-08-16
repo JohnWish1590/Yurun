@@ -214,6 +214,7 @@ class SettingsWindow:
         v["refine_model"] = tk.StringVar(value=c.get("api_model") or "deepseek-chat")
         v["hotkey"] = tk.StringVar(value=c.get("hotkey") or "`")
         v["trigger"] = tk.StringVar(value=c.get("trigger_mode") or "hold")
+        v["insert"] = tk.StringVar(value=c.get("insert_method") or "type")
 
     # ================= 构建 =================
     def _build(self):
@@ -361,6 +362,16 @@ class SettingsWindow:
         seg.pack(side="right")
         self._seg_trigger = seg
 
+        row3 = tk.Frame(body, bg=CARD)
+        row3.pack(fill="x", pady=(10, 0))
+        tk.Label(row3, text="粘贴方式", bg=CARD, fg=TEXT, font=(FONT, F)).pack(side="left")
+        seg2 = Segmented(row3, [("type", "逐字输入"), ("paste", "剪贴板")],
+                         self._on_insert, v["insert"].get())
+        seg2.pack(side="right")
+        self._seg_insert = seg2
+        tk.Label(body, text="逐字输入不污染剪贴板历史（默认）；个别窗口不兼容时切「剪贴板」",
+                 bg=CARD, fg=TEXT_DIM, font=(FONT, F_SMALL)).pack(anchor="w", pady=(2, 10))
+
     # ================= 控件 =================
     def _entry(self, parent, var, width=None, show=None):
         e = tk.Entry(parent, textvariable=var, font=(FONT, F),
@@ -402,6 +413,9 @@ class SettingsWindow:
     def _on_trigger(self, value):
         self._var["trigger"].set(value)
 
+    def _on_insert(self, value):
+        self._var["insert"].set(value)
+
     def _toggle_adv(self):
         self._adv_visible = not self._adv_visible
         if self._adv_visible:
@@ -438,6 +452,7 @@ class SettingsWindow:
         c.set("api_model", v["refine_model"].get().strip())
         c.set("hotkey", v["hotkey"].get().strip() or "`")
         c.set("trigger_mode", v["trigger"].get())
+        c.set("insert_method", v["insert"].get())
         messagebox.showinfo("语润", "设置已保存", parent=self.root)
         self.root.destroy()
 

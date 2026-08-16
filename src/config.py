@@ -44,6 +44,7 @@ DEFAULTS = {
     "auto_start": False,
     "proxy": "",                       # 留空=不走代理，如 http://127.0.0.1:7897
     "mirror": "https://hf-mirror.com",  # 模型下载镜像
+    "insert_method": "type",           # type=SendInput逐字(零剪贴板污染,默认) / paste=剪贴板+Ctrl+V(兜底)
 }
 
 class Config:

@@ -187,7 +187,7 @@ class App:
             log.info("录音开始 provider=%s tmp=%s", cfg.get("asr_provider", "sauc"), tmp_wav)
             ok, dur, err = record_to_file(
                 tmp_wav, stop_event=stop,
-                max_seconds=30, silence_timeout=0.0,
+                max_seconds=90, silence_timeout=0.0,
                 on_level=self._on_level,
             )
             if not ok or dur < 0.3:
@@ -356,13 +356,35 @@ class App:
             return {"ok": False, "text": text, "reason": "exception"}
 
     def _do_paste(self, text, hide=True, replace=False):
-        """主线程：写剪贴板 + 模拟 Ctrl+V。
+        """主线程：把 text 送进当前焦点窗口。
 
         - hide=True：粘贴后隐藏 pill（终态）。
         - replace=True（replace_paste 事件）：先 Ctrl+Z 撤销刚贴的原文，再 Ctrl+V
           粘贴润色版，确保是「替换」而非「追加」，绝不重复。
         - hide=False：先贴原文再后台润色，保留「正在润色」指示。
+
+        按 config 的 insert_method 分流：
+        - type（默认）：SendInput Unicode 逐字输入，不碰剪贴板，Win+V 历史零污染。
+        - paste：写剪贴板 + Ctrl+V（原路径，会污染剪贴板历史，作兜底）。
         """
+        cfg = get_config()
+        method = (cfg.get("insert_method") or "type").lower()
+        if method == "type" and not replace:
+            # 主路径：SendInput 逐字 Unicode 输入，不碰剪贴板
+            try:
+                from typer import type_text
+                # 短暂停顿让目标窗口焦点稳定
+                time.sleep(0.02)
+                sent = type_text(text)
+                log.info("SendInput 已投递 %d 字（type 模式，零剪贴板污染）", sent)
+                if hide:
+                    self.ui_q.put(("done", text))
+                return
+            except Exception as e:
+                log.warning("SendInput 输入失败: %s，回退剪贴板粘贴", e)
+                # 落到下面的 paste 路径作兜底
+
+        # paste 路径（兜底或用户显式选择）：写剪贴板 + Ctrl+V
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(text)

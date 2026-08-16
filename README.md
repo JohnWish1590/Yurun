@@ -193,10 +193,17 @@ pyinstaller --clean Yurun.spec
 ---
 
 📦 源码 / Issues / Releases：https://github.com/JohnWish1590/Yurun
+
 🐛 问题反馈：GitHub Issues
+
 📝 变更历史：CHANGELOG.md
+
 🚀 发布说明规范：RELEASE.md
+
 ⚡ 快速开始（部署细节）：docs/QUICKSTART.md
+
 🔒 隐私政策：PRIVACY.md
+
 🏪 上架清单（未来）：STORE_GUIDE.md
+
 Socials: @下一站澳门. DM for inquiries.

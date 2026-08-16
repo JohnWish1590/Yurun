@@ -11,6 +11,7 @@
 import ctypes
 import ctypes.wintypes as wt
 import os
+import sys
 import time
 
 from logger import get_logger
@@ -30,7 +31,11 @@ kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
 
 PROCESS_QUERY_LIMITED_INFO = 0x1000
 PROCESS_TERMINATE = 0x0001
-_YURUN_PROCESS_NAMES = {"yurun.exe", "python.exe", "pythonw.exe"}
+# 进程名集合：打包后的 exe 名（随 Yurun.spec 的 name 走）+ dev 模式的 python。
+# 用 sys.executable 动态取，保证 exe 改名(如 语润.exe)后单实例锁仍能认出自己人。
+_IS_FROZEN = getattr(sys, "frozen", False)
+_SELF_EXE_NAME = os.path.basename(sys.executable).lower()
+_YURUN_PROCESS_NAMES = {_SELF_EXE_NAME, "python.exe", "pythonw.exe"}
 
 
 def _process_image_name(pid: int) -> str:
@@ -121,12 +126,14 @@ kernel32.Process32NextW.restype = wt.BOOL
 
 
 def kill_other_yurun_exe() -> int:
-    """枚举进程，杀掉所有名为 yurun.exe 的进程(除自己)。
+    """枚举进程，杀掉所有与本程序同名的 exe 进程(除自己)。
 
-    兜底用：旧版本 exe(如 9288 僵尸)没写过 PID 文件，PID 文件法找不到它；
-    这里按进程名枚举，确保把任何旧 exe 僵尸都收掉。dev 模式(python.exe 跑
-    main.py)由 PID 文件法处理；本函数只针对打包后的 yurun.exe。
+    兜底用：旧版本 exe(僵尸)没写过 PID 文件，PID 文件法找不到它；这里按进程名
+    枚举，确保把任何旧 exe 僵尸都收掉。仅在打包(frozen)模式生效——dev 模式
+    (python.exe 跑 main.py)由 PID 文件法处理，且避免误杀其它 python 进程。
     """
+    if not _IS_FROZEN:
+        return 0
     me = os.getpid()
     snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if not snap:
@@ -140,13 +147,13 @@ def kill_other_yurun_exe() -> int:
         while True:
             name = pe.szExeFile.lower()
             pid = pe.th32ProcessID
-            if name == "yurun.exe" and pid != me:
+            if name == _SELF_EXE_NAME and pid != me:
                 h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
                 if h:
                     try:
                         if kernel32.TerminateProcess(h, 1):
                             killed += 1
-                            log.info("已结束旧 Yurun.exe PID=%s", pid)
+                            log.info("已结束旧实例 %s PID=%s", name, pid)
                     finally:
                         kernel32.CloseHandle(h)
             if not kernel32.Process32NextW(snap, ctypes.byref(pe)):

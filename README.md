@@ -150,17 +150,17 @@ run_yurun.bat
 
 ```powershell
 pyinstaller --clean Yurun.spec
-# 产物：dist/Yurun.exe
+# 产物：dist/语润.exe
 ```
 
 ### 2. Inno Setup 安装包（含中文、桌面快捷方式、干净卸载）
 
 ```powershell
 & "C:\Users\<你>\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer/yurun_setup.iss
-# 产物：dist/Yurun-Setup-0.1.8.exe
+# 产物：dist/语润-Setup-0.1.8.exe
 ```
 
-> 构建顺序：先 PyInstaller 生成 `dist/Yurun.exe`，再跑 Inno Setup（脚本会读取 `dist/Yurun.exe`）。
+> 构建顺序：先 PyInstaller 生成 `dist/语润.exe`，再跑 Inno Setup（脚本会读取 `dist/语润.exe`）。
 
 ---
 

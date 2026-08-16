@@ -51,7 +51,7 @@
 - **单实例锁动态识别（改名不失效）**：`src/singleinstance.py` 进程名校验改为动态取 `os.path.basename(sys.executable)` + `_IS_FROZEN` 守卫；改名 `语润.exe` 后单实例锁仍能认出自身进程并清理旧僵尸，`热键被占` bug 不回潮；`kill_other_yurun_exe` 仅在打包模式按自身 exe 名枚举，避免 dev 模式（python.exe）误杀其它 python 进程。
 - **README 更新**：补充 0.1.6–0.1.8 真实功能（单实例锁 / Plan B 润色不误吞前文 / 短句直出 ≤8 中文字 / 热键被占提示）与版本说明。
 - **.gitignore 加固**：追加 `dist_*/`、`build_*/` 通配，避免版本化构建目录再次沦为未跟踪废目录。
-- **目录收尾**：删除原版 `D:\SynologyDrive\CODING\yurun`（146MB），`yurun-stream` 为今后唯一版本；清理 `yurun-stream` 内冗余 `dist*/build*` 构建目录（释放约 880MB），仅留 `dist/语润.exe` 作为官方构建。
+- **目录收尾**：删除原版 `D:\SynologyDrive\CODING\yurun`（旧 v0.1.1 源码，146MB）；新代码在 `yurun-stream` 完成收尾后改回名为 `yurun`，成为当前唯一版本；清理 `yurun` 内冗余 `dist*/build*` 构建目录（释放约 880MB），仅留 `dist/语润.exe` 作为官方构建。
 
 ### 验证（补充）
 
@@ -309,7 +309,7 @@ oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首
 
 ### 五、打包命令
 
-    cd D:\SynologyDrive\CODING\yurun-stream
+    cd D:\SynologyDrive\CODING\yurun
     py -3 -m PyInstaller Yurun.spec --noconfirm
     # 产物 dist/语润.exe (onefile，内联 prompts/ 与 assets/)
     # 注：--clean 在部分开启安全删除拦截的环境会失败(内部 os.remove 被拦截)，可省略；
@@ -324,4 +324,4 @@ oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首
 - [x] ~~确认启动气泡彻底移除~~（0.1.5 已删，用最新打包版即可）。
 - [ ] 把仓库推到 GitHub(当前无远程，本地提交未同步)。
 - [x]（已解决·0.1.8 收尾）logger.py 的 YURUN_VERSION 已由 "0.1.0" → "0.1.8"，启动 banner 显示 v0.1.8，与 CHANGELOG 一致。
-- [x]（已解决·0.1.8 收尾）冗余 dist_v2~v5 / build_v2~v5 等中间产物已清理，仅留 dist/语润.exe 作为官方构建；原版仓库 D:\SynologyDrive\CODING\yurun 已删除，yurun-stream 为唯一版本。
+- [x]（已解决·0.1.8 收尾）冗余 dist_v2~v5 / build_v2~v5 等中间产物已清理，仅留 dist/语润.exe 作为官方构建；原版仓库 D:\SynologyDrive\CODING\yurun（旧 v0.1.1 源码）已删除，新代码收尾后由 yurun-stream 改名回 yurun，成为当前唯一版本。

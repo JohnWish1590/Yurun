@@ -115,7 +115,8 @@ class App:
             elif kind == "paste":
                 self._do_paste(evt[1], hide=(evt[2] if len(evt) > 2 else True))
             elif kind == "replace_paste":
-                # 润色完成：撤销刚贴的原文再粘贴润色版（替换，不重复），随后收尾。
+                # 方案B：润色完成走 ("paste", final, True)，不再产生 replace_paste 事件。
+                # 此分支保留仅作防御；若意外触发，按原 replace 语义处理。
                 self._do_paste(evt[1], hide=True, replace=True)
         except Exception as e:
             log.exception("UI 事件处理失败: %s", e)
@@ -260,18 +261,16 @@ class App:
             self.ui_q.put(("error", "没识别到内容"))
             return
 
-        # 第一步：原文直接粘贴（ASR 一返回就出），先不隐藏 pill。
-        self.ui_q.put(("paste", text, False))
-
         if self._refine_will_change(text):
-            # 真可能改动：显示「正在润色」并在后台润色，成功再 replace_paste。
+            # 方案B：不先贴原文，显示「正在润色」并后台润色，完成后一次性贴最终文本。
+            # 无 replace 步骤 → 从根上避免误删/误覆盖输入框里之前的内容。
             self.ui_q.put(("refining", None))
             threading.Thread(
-                target=self._refine_and_replace, args=(text, round_id), daemon=True
+                target=self._refine_and_paste, args=(text, round_id), daemon=True
             ).start()
         else:
-            # 不会改动（太短/未配置/无自定义指令且较短）：原文即最终结果，立即收尾。
-            self.ui_q.put(("done", text))
+            # 不会改动（太短/未配置/无自定义指令且较短）：原文即最终结果，立即贴出+收尾。
+            self.ui_q.put(("paste", text, True))
 
     def _refine_will_change(self, text) -> bool:
         """预估这次润色是否可能产生改动（用于决定是否显示「正在润色」）。
@@ -290,22 +289,18 @@ class App:
                 return False
         return True
 
-    def _refine_and_replace(self, text, round_id):
-        """后台润色：成功且变化 → replace_paste（撤销原文后粘贴润色版）；否则保持原文。"""
+    def _refine_and_paste(self, text, round_id):
+        """方案B：后台润色，完成后一次性粘贴最终文本（润色版或原文）。无 replace 步骤。"""
         # 若已有更新的录音轮次，旧润色作废，避免回插覆盖新内容。
         if round_id is not None and round_id != self._round_seq:
-            log.info("润色轮次过期（已有新录音），跳过替换")
+            log.info("润色轮次过期（已有新录音），跳过粘贴")
             self.ui_q.put(("done", text))
             return
         t_rf0 = time.time()
         result = self._refine(text)
         log.info("润色耗时=%.2fs ok=%s reason=%s", time.time() - t_rf0, result["ok"], result.get("reason"))
-        if result["ok"]:
-            self.ui_q.put(("replace_paste", result["text"]))
-        else:
-            if result.get("reason") not in ("no_change", "no_api_key", "bypass_short"):
-                log.warning("润色失败: %s，保持原文", result.get("reason"))
-            self.ui_q.put(("done", text))
+        final = result["text"] if result["ok"] else text
+        self.ui_q.put(("paste", final, True))
 
     def _transcribe(self, wav_path, cfg):
         """按配置选择识别引擎：cloud=云端 ASR / local=本地 Whisper。"""
@@ -447,6 +442,13 @@ class App:
             log.warning("预热部分依赖失败，将在首次使用时按需加载: %s", e)
 
     def run(self):
+        # 单实例锁：杀掉旧实例并接管，保证永远只有一个进程(也防僵尸占热键)
+        try:
+            from singleinstance import kill_old_and_takeover, kill_other_yurun_exe
+            kill_old_and_takeover()   # PID 文件法：覆盖 dev 模式 + 已知旧 PID
+            kill_other_yurun_exe()     # 进程名枚举法：兜底清理无 PID 文件的旧 exe 僵尸
+        except Exception as e:
+            log.warning("单实例检查失败: %s", e)
         log.info("语润启动（开发版）")
         # 仅本地离线模式才在启动时加载 Whisper 模型；云端 SAUC 用户无需等待/下载
         if self.cfg.get("asr_provider") == "local":
@@ -455,7 +457,7 @@ class App:
             log.info("识别引擎为 %s，跳过本地模型加载", self.cfg.get("asr_provider"))
         ok = self.hotkey.start(self.cfg.get("hotkey"), self.cfg.get("trigger_mode", "hold"))
         if not ok:
-            self.ui_q.put(("toast", "热键注册失败，请检查是否被占用"))
+            self.ui_q.put(("toast", "热键无效"))
         # 启动托盘（后台线程）
         threading.Thread(target=self.tray.start, daemon=True).start()
         # 后台预热重依赖，避免首次按下热键才现场加载 numpy/sounddevice/websocket/pyautogui

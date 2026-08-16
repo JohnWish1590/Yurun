@@ -57,17 +57,15 @@ class Tray:
 
     def start(self, title="语润 Yurun"):
         img = self._make_image()
-        ico_path = Tray._icon_path()
         menu = pystray.Menu(
             pystray.MenuItem("打开设置", lambda: self._safe(self._on_open_settings)),
             pystray.MenuItem("打开日志目录", lambda: self._safe(self._open_logs)),
             pystray.MenuItem("退出", lambda: self._safe(self._on_quit)),
         )
-        # 优先用 ico 文件路径交给 pystray 原生处理多尺寸；失败则退回 PIL Image
-        try:
-            self._icon = pystray.Icon("yurun", icon=ico_path, title=title, menu=menu)
-        except Exception:
-            self._icon = pystray.Icon("yurun", img, title, menu)
+        # pystray 的 icon 参数必须是 PIL Image；传字符串路径会在 setup 线程
+        # 抛 'str' object has no attribute 'save'（构造不报错、后台 setup 才崩，
+        # 故 try/except 兜底无效）。img 已由 _make_image() 用 PIL 加载好。
+        self._icon = pystray.Icon("yurun", img, title, menu)
         try:
             self._icon.run()
         except Exception as e:

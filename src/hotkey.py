@@ -164,7 +164,8 @@ class HotkeyListener:
 
         if not user32.RegisterHotKey(self._hwnd, 1, MOD_NOREPEAT, self._vk):
             err = ctypes.get_last_error() or 0
-            self._fail(f"热键注册失败（错误码 {err}），可能已被其他程序占用")
+            log.warning("热键注册失败（错误码 %s），可能已被其他程序占用", err)
+            self._fail("热键被占")  # pill 132 宽装不下长文案，显示 4 字短提示
             return
 
         if self.trigger_mode == "hold":

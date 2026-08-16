@@ -4,6 +4,86 @@
 
 ---
 
+## [0.1.8] — 2026-08-16 · 单实例锁（永远只有一个进程）+ pill 失败文案修复
+
+> **编辑**：WorkBuddy（GLM-5.2，本仓库 AI 协作 agent）
+> **涉及文件**：新增 src/singleinstance.py；src/main.py、src/hotkey.py、Yurun.spec
+> **背景**：用户反馈①连测多个版本后留了 Yurun.exe 僵尸进程（如 PID 9288）占着反引号热键，导致新启动实例 `RegisterHotKey` 失败、弹"热键注册失败"框；②该失败提示文案"热键注册失败（错误码 X），可能已被其他程序占用"在固定 132×50 pill 里被截成"热键注册失"。用户进一步提出关键担忧：若旧进程活着但任务栏没图标（托盘崩溃/没显示），用户点不到"退出"，新进程也注册失败，会被彻底卡死、没法用。
+
+### 改动点
+
+- **单实例锁：新进程杀旧、自己接管**（核心）。新建 `src/singleinstance.py`：
+  - `kill_old_and_takeover()`：PID 文件法（`%APPDATA%/Yurun/yurun.pid`）。读旧 PID → 用 `QueryFullProcessImageNameW` 校验进程名属 `{yurun.exe, python.exe, pythonw.exe}` 才杀（防 PID 被回收后误杀别的程序）→ `TerminateProcess` 杀掉 → 等 0.6s 让旧实例释放全局热键 → 写入自身 PID。
+  - `kill_other_yurun_exe()`：用 `CreateToolhelp32Snapshot` 枚举所有进程，杀掉所有名为 `yurun.exe` 的非自身实例。**兜底清理无 PID 文件的旧版本 exe 僵尸**（如 9288 这种旧版本从没写过 pid 文件，PID 文件法找不到它）。
+  - `main.py run()` 起头依次调用两个函数，先于热键/托盘启动。
+- **设计意图**：不做"新实例直接退出"（那会把用户卡死），而是"新实例杀旧、自己继续"，保证用户哪怕旧实例是没图标的隐形僵尸，双击一次就能把旧的收掉、新的接管——**永远不会被卡死**。
+- **pill 失败文案缩短**（`src/hotkey.py`）：`RegisterHotKey` 失败时，pill 提示从长文案缩成 **"热键被占"** 4 字（132 宽 pill 装得下，不再截断）；完整错误码仍写进 `yurun.log` 便于排查。`main.py` 里 `vk=0`（按键名无法识别）路径的 toast 同步缩成 **"热键无效"**。
+- **打包**：`Yurun.spec` 的 `hiddenimports` 增加 `'singleinstance'`，防 PyInstaller 静态分析漏掉 `run()` 内的函数级 import。
+
+### 验证（实战）
+
+启动前 `tasklist` 显示 `Yurun.exe 9288`（僵尸）在跑；启动新 exe 后日志写：
+```
+已结束旧 Yurun.exe PID=9288
+已结束旧 Yurun.exe PID=3920   ← 另一个未察觉的僵尸也被收掉
+语润启动（开发版）
+识别引擎为 sauc               ← 热键注册成功（无"热键被占"）
+```
+启动后 `tasklist` 仅剩新实例一个 `Yurun.exe`。**单实例锁实战生效，"僵尸占热键→新进程失败→卡死"的恐惧彻底解除。**
+
+### 行为变化（对协作同学说明）
+
+- 以后任何时候双击 Yurun.exe，旧实例（含无图标僵尸）会被自动收掉，永远只有一个进程。
+- PID 文件位于 `%APPDATA%\Yurun\yurun.pid`（纯文本，记当前实例 PID）。
+- 热键失败提示现在是 4 字短文案；排查看日志而非 pill。
+
+---
+
+## [0.1.7] — 2026-08-16 · 润色改同步一次贴（方案 B，弃用 replace_paste）
+
+> **编辑**：WorkBuddy（GLM-5.2，本仓库 AI 协作 agent）
+> **涉及文件**：src/main.py
+> **背景**：0.1.2 引入"原文先贴 + 后台润色 + replace_paste 替换"，0.1.3 把 replace_paste 改成"Ctrl+Z 撤原文 + Ctrl+V 贴润色版"。用户实测：润色完按 Ctrl+Z 时，**很多输入框（聊天框/浏览器/Electron）的撤销粒度是"整段历史"而非"最后一次粘贴"**，把之前说的话全删了，只剩润色那句。曾临时试过"Shift+Left×N 选中原文再覆盖"（方案 A），多句连说场景仍会误吃前句，用户否决，改采方案 B。
+
+### 改动点
+
+- **`_after_transcribe` 改为不先贴原文**（方案 B）：`_refine_will_change` 为真时，只显示"正在润色"并起后台线程 `_refine_and_paste`；润色完成后一次性 `("paste", final, True)` 贴最终文本（润色版或原文）。bypass 短句仍走 `("paste", text, True)` 即时贴。
+- **`_refine_and_replace` → `_refine_and_paste`**：去掉 `replace_paste` 事件产生，润色完直接 `paste`。保留 `_round_seq` 轮次守卫（重叠录音时旧润色作废，不回插）。
+- **`replace_paste` UI 分支与 `_do_paste(replace=True)` 路径保留为防御性死代码**（注释标注方案 B 不再产生该事件），逻辑回退到 0.1.5 的 Ctrl+Z 版本以保持基线一致。
+- **从根上消除误删**：无 replace 步骤 = 不可能误删输入框里之前的内容。
+
+### 行为变化（对协作同学说明）
+
+- 松手后**不再立刻出原文**；润色会改的句子要等润色完（约 0.5~5.9s，受端点波动）才一次性出最终文本，中间只显示"正在润色"。短句（≤8 有效字符）仍秒出。
+- 代价是"松手即出字"的即时感让位于"绝不误删之前内容"的可靠性。用户已拍板接受。
+
+### 已知限制
+
+- 润色慢时（如 DeepSeek 服务端 ~5.3s）松手到出字有数秒空白；治本需换更快端点（火山 Doubao 等），非本次范围。
+
+---
+
+## [0.1.6] — 2026-08-16 · 修复托盘图标崩溃（0.1.5 引入的 string-path bug）
+
+> **编辑**：WorkBuddy（GLM-5.2，本仓库 AI 协作 agent）
+> **涉及文件**：src/tray.py
+> **背景**：0.1.5 把托盘图标加载"优化"为 `pystray.Icon(icon=ico_path)` 传字符串路径、不再传 PIL Image。实测每次启动都在后台 `setup_handler` 线程崩 `AttributeError: 'str' object has no attribute 'save'`（pystray 的 `serialized_image` 对字符串调 `.save()`），托盘图标不显示。0.1.5 自己在 CHANGELOG 里也承认"任务栏图标仍不显示，根因未定位"。
+
+### 改动点
+
+- **`src/tray.py` `start()`**：删掉传字符串路径 `pystray.Icon(icon=ico_path)` 与无效 try/except 兜底（构造不报错、崩在 setup 线程，兜底永远走不到），改回传 PIL Image `img`（`_make_image()` 已用 `Image.open().convert("RGBA").resize()` 加载好）。
+- 原理：pystray 的 `icon` 参数要 PIL Image 对象，不是文件路径字符串。
+
+### 验证
+
+dev 模式 + 打包 exe 两次实测，启动日志均不再出现 `'str' object has no attribute 'save'` 崩溃，托盘图标正常创建。0.1.5 交接说明里"未解决"的①②项（启动失败、托盘不显示）由本版解决。
+
+### 行为变化（对协作同学说明）
+
+- 0.1.5 引入的托盘回归 bug 修复；托盘图标恢复显示，用户可右键正常退出，不再产隐形僵尸进程（但仍建议配合 0.1.8 单实例锁做兜底）。
+
+---
+
 ## [0.1.5] — 2026-08-15 · 去除启动气泡 + 修复任务栏图标
 
 > **编辑**：Cindy（本仓库 AI 协作 agent）
@@ -183,6 +263,9 @@ oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首
 | 0.1.3 | 08-14 | 三态标签时序(录音→识别→润色)；润色收尾(短句/未改动立即收尾)；replace_paste 用 Ctrl+Z 撤销再粘贴(防重复)；提示框锚定焦点窗口(不再跟鼠标)；录音药丸回退原版红点+转圈；托盘换绘制麦克风；修 caret None 日志崩溃 | main.py, pill.py, tray.py |
 | 0.1.4 | 08-15 | 统一图标：程序/exe/任务栏/设置窗 全用 favicon.ico(16/32/48/64+透明)；Yurun.spec 打包 assets；托盘 _MEIPASS 容错 | assets/icon.ico, Yurun.spec, tray.py, gui.py |
 | 0.1.5 | 08-15 | 移除启动引导气泡；修复任务栏图标不显示(根因 @staticmethod 内 __file__ 作用域歧义致 _icon_path 返回 None，改为模块加载时解析 ASSETS_ICON 常量) | main.py, tray.py |
+| 0.1.6 | 08-16 | 修复托盘图标崩溃(0.1.5 引入的 string-path bug：pystray.Icon(icon=字符串路径) 改回传 PIL Image) | tray.py |
+| 0.1.7 | 08-16 | 润色改同步一次贴(方案B)：不先贴原文、润色完一次 paste 最终文本；弃用 replace_paste(Ctrl+Z 撤销法跨 app 误删整段历史) | main.py |
+| 0.1.8 | 08-16 | 单实例锁(新进程杀旧接管：kill_old_and_takeover+kill_other_yurun_exe)；pill 失败文案缩成"热键被占"/"热键无效" | 新增 singleinstance.py, main.py, hotkey.py, Yurun.spec |
 
 ### 二、已验证
 
@@ -191,11 +274,11 @@ oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首
 - 打包后 _MEIPASS/assets/icon.ico 运行时存在；托盘路径可解析(开发模式 ASSETS_ICON 指向 assets/icon.ico 且 exists)。
 - dist/Yurun.exe 可生成(约68MB onefile)。
 
-### 三、当前未解决 / 用户最新反馈(08-16，需接手)
+### 三、原"未解决"项状态（08-16 由 WorkBuddy/GLM-5.2 接手后更新）
 
-1. 程序启动即失败：用户报告一允许就跳 注册热键失败，且启动气泡还是显示不全(应已移除，可能旧 exe 缓存或打包未生效)。
-2. 任务栏图标仍不显示：尽管 0.1.5 修了路径解析，实测感觉没运行成功，托盘图标依旧缺失。怀疑 pystray 打包环境仍有静默异常(原 except 吞错)或 explorer 缓存。
-3. 以上两点均未在代码中定位确定根因，只按现象改过；需接手者实际跑 dist/Yurun.exe 看 %APPDATA%\Yurun\logs\yurun.log 真实报错。
+1. ~~程序启动即失败、弹"热键注册失败"~~ → **已解决（0.1.8）**。根因坐实：连测多版本后留了 Yurun.exe 僵尸进程占着反引号热键（实测机器上有 PID 9288）。单实例锁启动时杀旧接管，实战验证把 9288 + 另一个 3920 僵尸都收掉了，热键注册成功。
+2. ~~任务栏图标仍不显示~~ → **已解决（0.1.6）**。根因：0.1.5 把 `pystray.Icon(icon=ico_path)` 传了字符串路径（pystray 要 PIL Image），后台 setup 线程崩 `'str' object has no attribute 'save'`。改回传 PIL Image 后托盘正常。
+3. ~~启动气泡显示不全~~ → 0.1.5 已删 `after(600, guide)`；若仍出现为旧 exe 缓存，用最新打包版即可。
 
 ### 四、关键排查入口
 
@@ -214,7 +297,9 @@ oot.after(600, ... guide ...)，程序启动后直接进主循环，不再弹首
 
 ### 六、紧急待办
 
-- [ ] 修复启动 注册热键失败(最高优先级，程序目前打不开)。
-- [ ] 确认/修复任务栏托盘图标在打包环境下真实显示。
-- [ ] 确认启动气泡彻底移除(排除旧 exe 缓存)。
+- [x] ~~修复启动 注册热键失败~~（0.1.8 单实例锁解决）。
+- [x] ~~确认/修复任务栏托盘图标在打包环境下真实显示~~（0.1.6 解决）。
+- [x] ~~确认启动气泡彻底移除~~（0.1.5 已删，用最新打包版即可）。
 - [ ] 把仓库推到 GitHub(当前无远程，本地提交未同步)。
+- [ ]（新增）logger.py 的 YURUN_VERSION 仍写 "0.1.0"，启动 banner 显示 v0.1.0，与 CHANGELOG(0.1.8) 不一致，待统一。
+- [ ]（新增）沙箱环境无法覆盖旧 dist 目录，本机会留多个 dist_v2~v5 中间产物；用户本机可 `pyinstaller --clean Yurun.spec` 重建到 dist 并清理中间目录。

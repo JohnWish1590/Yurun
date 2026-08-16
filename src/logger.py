@@ -15,7 +15,7 @@ import traceback
 from pathlib import Path
 
 APP_NAME = "Yurun"
-YURUN_VERSION = "0.1.9"
+YURUN_VERSION = "0.1.10"
 
 # 全局 Tk root 引用（由 main 在创建后注册），用于捕获 Tk 回调异常
 _tk_root = None

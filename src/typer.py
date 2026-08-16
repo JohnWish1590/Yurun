@@ -100,9 +100,11 @@ def type_text(text: str, chunk_pause: float = 0.0) -> int:
             inputs.append(_make_unicode_input(code, True))
 
     # 一次性批量发送（SendInput 单次可处理大量事件，200 字 < 50ms）
+    # 关键：用 cast(arr, POINTER(INPUT)) 转成 LP_INPUT；直接 byref 或传数组名会因类型不匹配抛
+    # TypeError（v0.1.9 首发踩过这个坑：每次 SendInput 失败回退剪贴板）。
     n = len(inputs)
     arr = (INPUT * n)(*inputs)
-    sent = _user32.SendInput(n, ctypes.byref(arr), ctypes.sizeof(INPUT))
+    sent = _user32.SendInput(n, ctypes.cast(arr, ctypes.POINTER(INPUT)), ctypes.sizeof(INPUT))
     if sent != n:
         log.warning("SendInput 仅投递 %d/%d 个事件", sent, n)
     return sent

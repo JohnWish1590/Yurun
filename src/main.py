@@ -39,7 +39,7 @@ log = get_logger("yurun")
 install_crash_handler()
 log_startup_banner()
 
-APP_TITLE = "语润 Yurun"
+APP_TITLE = "语润"
 
 
 class App:

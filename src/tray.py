@@ -55,7 +55,7 @@ class Tray:
             pass
         return Image.new("RGBA", (size, size), (0, 0, 0, 0))
 
-    def start(self, title="语润 Yurun"):
+    def start(self, title="语润"):
         img = self._make_image()
         menu = pystray.Menu(
             pystray.MenuItem("打开设置", lambda: self._safe(self._on_open_settings)),
@@ -86,7 +86,7 @@ class Tray:
         except Exception:
             pass
 
-    def notify(self, message: str, title: str = "语润 Yurun"):
+    def notify(self, message: str, title: str = "语润"):
         """显示通知气泡（可选，程序主要用迷你浮窗）。"""
         def _do():
             try:

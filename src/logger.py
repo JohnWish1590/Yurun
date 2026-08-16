@@ -121,7 +121,7 @@ def log_startup_banner():
     import platform
     log = get_logger("yurun")
     log.info("=" * 56)
-    log.info("语润 Yurun v%s 启动", YURUN_VERSION)
+    log.info("语润 v%s 启动", YURUN_VERSION)
     log.info("Python %s", sys.version.split()[0])
     log.info("平台: %s", platform.platform())
     log.info("日志目录: %s", logs_dir())

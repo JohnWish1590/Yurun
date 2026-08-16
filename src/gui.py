@@ -175,7 +175,7 @@ class SettingsWindow:
             self.root = tk.Tk()
         else:
             self.root = tk.Toplevel(master)
-        self.root.title("语润 Yurun · 设置")
+        self.root.title("语润 · 设置")
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
         # 设置窗口图标（与程序/任务栏一致：assets/icon.ico）
@@ -220,7 +220,7 @@ class SettingsWindow:
         self.body = tk.Frame(self.root, bg=BG)
         self.body.pack(fill="both", expand=True, padx=28, pady=14)
 
-        tk.Label(self.body, text="语润 Yurun", bg=BG, fg=TEXT,
+        tk.Label(self.body, text="语润", bg=BG, fg=TEXT,
                  font=(FONT, F_TITLE, "bold")).pack(anchor="w")
         tk.Label(self.body, text="按住快捷键说话。松开即润色输出",
                  bg=BG, fg=TEXT_DIM, font=(FONT, F_SMALL)).pack(anchor="w", pady=(2, 10))
@@ -438,7 +438,7 @@ class SettingsWindow:
         c.set("api_model", v["refine_model"].get().strip())
         c.set("hotkey", v["hotkey"].get().strip() or "`")
         c.set("trigger_mode", v["trigger"].get())
-        messagebox.showinfo("语润 Yurun", "设置已保存", parent=self.root)
+        messagebox.showinfo("语润", "设置已保存", parent=self.root)
         self.root.destroy()
 
     def _on_close(self):

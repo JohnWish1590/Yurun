@@ -111,7 +111,7 @@ class HotkeyListener:
     def start(self, key_name: str, trigger_mode: str = "hold") -> bool:
         self._vk = _vk_for(key_name)
         if self._vk == 0:
-            self._fail(f"无法识别的按键: {key_name}")
+            self._fail("按键无效")
             return False
         self._key_name = key_name
         self.trigger_mode = trigger_mode
@@ -151,7 +151,7 @@ class HotkeyListener:
             wc.hInstance = kernel32.GetModuleHandleW(None)
             wc.lpszClassName = "YurunHotkeyWindow"
             if not user32.RegisterClassW(ctypes.byref(wc)):
-                self._fail("热键窗口类注册失败")
+                self._fail("启动失败")
                 return
             _CLASS_REGISTERED = True
 
@@ -159,7 +159,7 @@ class HotkeyListener:
             0, "YurunHotkeyWindow", "Yurun", 0, 0, 0, 0, 0,
             0, 0, kernel32.GetModuleHandleW(None), 0)
         if not self._hwnd:
-            self._fail("热键窗口创建失败")
+            self._fail("启动失败")
             return
 
         if not user32.RegisterHotKey(self._hwnd, 1, MOD_NOREPEAT, self._vk):

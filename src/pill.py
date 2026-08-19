@@ -44,6 +44,7 @@ BORDER_LIGHT = "#dcdcdc"  # 浅色主题加细边框，白底上才看得见
 TRANSPARENT = "#0d0d0d"  # 用于去四角的透明色（避免与主题色冲突）
 FONT = ("Microsoft YaHei UI", 15)
 FONT_GUIDE = ("Microsoft YaHei UI", 13)
+ERROR_FONT_SIZES = (15, 13, 11)  # 错误文本自适应：统一从 15px 起缩，放得下就不截断（无省略号）
 
 _user32 = ctypes.windll.user32
 _user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.c_void_p]
@@ -240,10 +241,10 @@ def _focus_rect():
 
 # 活动态硬超时（秒）：一旦超过立即强制报错退出，杜绝 indicator 卡死
 # 注：识别/润色态不设硬超时——后台跑多久都等，不再误报「处理超时」。
-#     录音态保留 40s 兜底（录音有 max_seconds 自然终止，40s 仅防录音线程异常卡死）。
-STATE_TIMEOUT = {
-    "recording": 40,
-}
+# 活动态硬超时：录音不再设假报错（v0.1.18：40s 假报错与 max_seconds=90 矛盾，
+# 用户实测"跳录音超时还能正常录"）。录音时长由 main max_seconds=90 自然终止，
+# 80s 时气泡提示「还剩10秒」（见 _tick）。识别/润色态本就无硬超时。
+STATE_TIMEOUT = {}
 AUTO_HIDE = {
     "guide": 3500,
     "error": 2400,
@@ -270,9 +271,8 @@ class PillBubble:
         self._hide_after = 0
         self._fade = None
         self._dot_pulse = 0.0
+        self._warned_80 = False  # 录音 80s「还剩10秒」是否已提示
         self._light = False  # 当前主题（False=深色）
-        self._last_repos_check = 0.0  # 上次轻量重定位时间
-        self._last_xy = None  # 上次定位坐标
 
         self.win = tk.Toplevel(master)
         self.win.withdraw()
@@ -298,15 +298,29 @@ class PillBubble:
         self.dot = self.canvas.create_oval(
             DOT_X - DOT_R, H // 2 - DOT_R, DOT_X + DOT_R, H // 2 + DOT_R,
             fill="#E53935", outline="")
+        # 引导态图标：浅蓝点（表示"准备开始"，区别于录音红点）
+        self.guide_dot = self.canvas.create_oval(
+            DOT_X - DOT_R, H // 2 - DOT_R, DOT_X + DOT_R, H // 2 + DOT_R,
+            fill="#007AFF", outline="")
         self.spinner = self.canvas.create_arc(
             SPIN_X - SPIN_R, H // 2 - SPIN_R, SPIN_X + SPIN_R, H // 2 + SPIN_R,
             start=0, extent=270, style="arc",
             outline=SPIN_DARK, width=2.4)
+        # 错误态图标：圆底感叹号（canvas 画，不占文本空间，杜绝 ⚠ emoji 渲染挤压文字）
+        self.err_bg = self.canvas.create_oval(
+            DOT_X - 9, H // 2 - 9, DOT_X + 9, H // 2 + 9,
+            fill="#E53935", outline="")
+        self.err_text = self.canvas.create_text(
+            DOT_X, H // 2, text="!", fill="#FFFFFF",
+            font=("Microsoft YaHei UI", 12, "bold"))
         self.text = self.canvas.create_text(
             TEXT_X, H // 2, anchor="w",
             text="", fill=TEXT_DARK, font=FONT)
         self.canvas.itemconfig(self.dot, state="hidden")
         self.canvas.itemconfig(self.spinner, state="hidden")
+        self.canvas.itemconfig(self.err_bg, state="hidden")
+        self.canvas.itemconfig(self.err_text, state="hidden")
+        self.canvas.itemconfig(self.guide_dot, state="hidden")
 
     # ============ 公共接口（主线程调用） ============
     def _apply_theme(self, light):
@@ -329,6 +343,7 @@ class PillBubble:
         self._state_entered = time.time()
         self._fade = None
         self._hide_after = 0
+        self._warned_80 = False
         self._detect_and_apply_theme()
         self._reposition()
         try:
@@ -346,11 +361,11 @@ class PillBubble:
             if light is not None:
                 self._apply_theme(light)
 
-    def show_guide(self, text="按住 ` 键 说话"):
+    def show_guide(self, text="开始录音"):
         self._enter("guide")
-        self._set_icon(None)
-        self.canvas.itemconfig(self.text, text=text, font=FONT_GUIDE)
-        self._center_text()
+        self._set_icon("guide")
+        self.canvas.itemconfig(self.text, text=text, font=FONT)
+        self.canvas.coords(self.text, TEXT_X, H // 2)
         self._hide_after = AUTO_HIDE["guide"]
 
     def start_recording(self):
@@ -368,11 +383,21 @@ class PillBubble:
         self.canvas.itemconfig(self.text, text="正在润色", font=FONT)
         self.canvas.coords(self.text, TEXT_X, H // 2)
 
+    def show_transcribing(self):
+        """松手后、ASR 等待期：显示「⟳ 正在识别」。"""
+        self._enter("transcribing")
+        self._set_icon("spinner")
+        self.canvas.itemconfig(self.text, text="正在识别", font=FONT)
+        self.canvas.coords(self.text, TEXT_X, H // 2)
+
     def show_error(self, msg="出错了"):
         self._enter("error")
-        self._set_icon(None)
-        self.canvas.itemconfig(self.text, text="⚠ " + msg, font=FONT_GUIDE)
-        self._center_text()
+        self._set_icon("error")
+        # 纯文本错误消息 + 圆底感叹号，字体与「正在录音/润色」统一 15px
+        # （不再用 "⚠ " 文本前缀：⚠ 在 Windows 渲染成 emoji 会挤压/顶出文字）
+        self.canvas.itemconfig(self.text, text=msg, font=FONT)
+        self.canvas.coords(self.text, TEXT_X, H // 2)
+        self._fit_error_text(msg)
         self._hide_after = AUTO_HIDE["error"]
 
     def force_idle(self):
@@ -397,34 +422,42 @@ class PillBubble:
     def _reposition(self):
         """将气泡定位到当前光标正下方（带 OFFSET_X 偏移），每次进入活动态时调用。"""
         x, y = _compute_anchor()
-        self._last_xy = (x, y)
         try:
             self.win.geometry(f"{W}x{H}+{x}+{y}")
         except Exception:
             pass
 
-    def _maybe_reposition(self):
-        """仅当 caret 移动 > 60px 时才更新窗口位置，避免 rcCaret 抖动。"""
-        new = _compute_anchor()
-        cur = getattr(self, "_last_xy", None)
-        if cur is None:
-            self._last_xy = new
-            try:
-                self.win.geometry(f"{W}x{H}+{new[0]}+{new[1]}")
-            except Exception:
-                pass
-            return
-        if abs(new[0] - cur[0]) > 60 or abs(new[1] - cur[1]) > 60:
-            self._last_xy = new
-            try:
-                self.win.geometry(f"{W}x{H}+{new[0]}+{new[1]}")
-            except Exception:
-                pass
-            _log.debug("pill 重定位: (%d,%d) -> (%d,%d)", cur[0], cur[1], new[0], new[1])
-
     def _set_icon(self, which):
         self.canvas.itemconfig(self.dot, state="hidden" if which != "dot" else "normal")
         self.canvas.itemconfig(self.spinner, state="hidden" if which != "spinner" else "normal")
+        show_err = which == "error"
+        self.canvas.itemconfig(self.err_bg, state="normal" if show_err else "hidden")
+        self.canvas.itemconfig(self.err_text, state="normal" if show_err else "hidden")
+        show_gd = which == "guide"
+        self.canvas.itemconfig(self.guide_dot, state="normal" if show_gd else "hidden")
+
+    def _fit_error_text(self, msg):
+        """错误文本自适应：优先缩小字体到放得下（13→11→10px），不加省略号。
+
+        v0.1.17 用户反馈：长消息被截断成「没听到声音…」带省略号，要求只显示
+        简短文本。方案：错误文案本身缩到 ≤6 字 + 这里字体缩小兜底，正常情况
+        永不截断；仅 10px 仍超宽（几乎不可能）才截断加省略号。
+        """
+        if not msg:
+            return msg
+        for size in ERROR_FONT_SIZES:
+            self.canvas.itemconfig(self.text, font=("Microsoft YaHei UI", size))
+            try:
+                self.win.update_idletasks()
+                bb = self.canvas.bbox(self.text)
+                w = (bb[2] - bb[0]) if bb else 0
+            except Exception:
+                w = 0
+            if w <= W - TEXT_X - 10:
+                return
+        # 极端兜底：10px 仍超宽，截断
+        self.canvas.itemconfig(self.text, text=msg[:6] + "…",
+                               font=("Microsoft YaHei UI", ERROR_FONT_SIZES[-1]))
 
     def _center_text(self):
         try:
@@ -437,15 +470,10 @@ class PillBubble:
             self.canvas.coords(self.text, max(TEXT_X, (W - tw) // 2), H // 2)
 
     def _tick(self):
-        """主线程每 40ms：动画 + 超时心跳 + 自动隐藏/淡出 + 轻量重定位。"""
+        """主线程每 40ms：动画 + 超时心跳 + 自动隐藏/淡出。"""
         if self._state == "idle":
             return
         now = time.time()
-
-        to = STATE_TIMEOUT.get(self._state)
-        if to is not None and now - self._state_entered > to:
-            self.show_error("处理超时，重试一次")
-            return
 
         if self._state == "recording":
             self._dot_pulse += 0.18
@@ -454,17 +482,19 @@ class PillBubble:
                 self.dot,
                 DOT_X - r, H // 2 - r, DOT_X + r, H // 2 + r,
             )
+            # 录音 80s 提示「还剩10秒」（max_seconds=90 自然终止；只换图标/文字不切状态）
+            if now - self._state_entered >= 80 and not self._warned_80:
+                self._warned_80 = True
+                self._set_icon("error")
+                self.canvas.itemconfig(self.text, text="还剩10秒", font=FONT)
+                self.canvas.coords(self.text, TEXT_X, H // 2)
 
         if self._state == "refining":
             self._spin = (self._spin + 12) % 360
             self.canvas.itemconfig(self.spinner, start=self._spin)
 
-        # 轻量重定位：录音/润色中每 800ms 抓一次 caret，偏差 > 60px 才更新
-        # （避免每次 rcCaret 抖动都触发；用户切换窗口/输入框也能跟到）
-        if self._state in ("recording", "refining"):
-            if now - self._last_repos_check > 0.8:
-                self._last_repos_check = now
-                self._maybe_reposition()
+        # 不做随动重定位：状态窗口（正在录音/识别/润色）停在第一次弹出的位置，
+        # 直到本次结束（v0.1.18 用户要求：不要因为鼠标/光标移动跟着跑）。
 
         if self._hide_after > 0:
             self._hide_after -= 40

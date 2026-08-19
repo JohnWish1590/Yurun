@@ -60,6 +60,27 @@ def content_length(s) -> int:
     return n
 
 
+def strip_numeric_trailing_punct(s) -> str:
+    """数字串/编号类文本去掉末尾标点（ASR 引擎会为纯数字预测句号）。
+
+    背景：火山 SAUC 等 ASR 引擎自带标点预测，纯数字/手机号/订单号常被补末尾
+    句号（如「12345。」），免润色 bypass 直接贴原文时句号跟着进来，改润色
+    prompt 无效（根本没走 LLM）。故在代码层兜底：
+    - 末尾是标点 且 文本数字占比 ≥ 60%（数字为主）→ 去掉末尾标点；
+    - 正常句子（数字占比低）保留标点，不受影响。
+    """
+    t = str(s or "").strip()
+    if not t:
+        return str(s or "")
+    digits = sum(1 for ch in t if ch.isdigit())
+    alnum = sum(1 for ch in t if ch.isalnum())
+    if alnum and digits / alnum >= 0.6:
+        cleaned = t.rstrip("。．.！!？?；;，,、")
+        if cleaned:
+            return cleaned
+    return t
+
+
 def is_diverged(source: str, refined: str) -> bool:
     a = content_length(source)
     b = content_length(refined)
@@ -68,15 +89,18 @@ def is_diverged(source: str, refined: str) -> bool:
     return b >= a * DIVERGENCE_MIN_LENGTH_RATIO
 
 
+BYPASS_MAX_LENGTH = 15  # 免润色阈值：有效字符 ≤ 此值直接贴原文，不调 LLM（短句 ASR 已够清楚）
+
+
 def _should_bypass_llm(source: str, custom_instructions: str) -> bool:
     """短句且无自定义指令时跳过 LLM，直接用 ASR 原文，省一次网络往返。
 
     仅对较短、且无用户规则引导的输入生效；有自定义指令时必须走 LLM。
-    用 content_length 统计有效字符（忽略标点/空白），阈值 8 字以内视为短句跳过。
+    用 content_length 统计有效字符（忽略标点/空白），阈值 15 字以内视为短句跳过。
     """
     if custom_instructions and custom_instructions.strip():
         return False
-    return content_length(source) <= 8
+    return content_length(source) <= BYPASS_MAX_LENGTH
 
 
 def extract_json(text: str):
@@ -103,6 +127,48 @@ def extract_json(text: str):
     return None
 
 
+PROMPT_VERSION = "dictation-refinement.zh.v17"
+
+
+def _build_user_payload(dictation_text, language, custom_instructions,
+                        user_dictionary, selection_before, selection_after):
+    """构造润色请求的 user payload。字段顺序即缓存前缀：稳定字段在前，易变字段在后。"""
+    context = {}
+    if language and language != "auto":
+        context["sourceLanguage"] = language
+    if custom_instructions:
+        context["userRefinementInstructions"] = custom_instructions
+    if user_dictionary:
+        context["userDictionary"] = user_dictionary
+    if selection_before:
+        context["selectionBefore"] = selection_before[-1200:]
+    if selection_after:
+        context["selectionAfter"] = selection_after[:1200]
+    return json.dumps({
+        "promptVersion": PROMPT_VERSION,
+        "context": context,
+        "dictationText": dictation_text,
+    }, ensure_ascii=False)
+
+
+STREAM_OUTPUT_INSTRUCTION = (
+    "输出要求：\n"
+    "- 直接返回最终要插入的文本本身，不要 JSON、不要引号、不要任何解释、标题、Markdown 代码块或前后缀说明。\n"
+    "- 如果文本已经清楚，原样返回。"
+)
+
+
+def _load_stream_prompt(path=None):
+    """流式用 system prompt：沿用 Cindy 原 prompt 精华，仅把「输出要求」段替换为纯文本直出。"""
+    base = _load_prompt(path or PROMPT_ZH)
+    if not base:
+        return ""
+    idx = base.find("输出要求")
+    if idx != -1:
+        base = base[:idx].rstrip()
+    return base + "\n\n" + STREAM_OUTPUT_INSTRUCTION
+
+
 def refine_text(
     text: str,
     api_key: str,
@@ -114,7 +180,8 @@ def refine_text(
     selection_after: str = "",
     language: str = "zh",
     proxy: str = "",
-    timeout: int = 10,
+    timeout: int = 30,
+    disable_thinking: bool = True,
     prompt_path: Path = None,
 ) -> dict:
     """润色听写文本。返回 {"ok": bool, "text": str, "reason": str}"""
@@ -130,23 +197,8 @@ def refine_text(
     if not system:
         return {"ok": False, "text": source, "reason": "prompt_missing"}
 
-    context = {}
-    if language and language != "auto":
-        context["sourceLanguage"] = language
-    if custom_instructions:
-        context["userRefinementInstructions"] = custom_instructions
-    if user_dictionary:
-        context["userDictionary"] = user_dictionary
-    if selection_before:
-        context["selectionBefore"] = selection_before[-1200:]
-    if selection_after:
-        context["selectionAfter"] = selection_after[:1200]
-
-    user = json.dumps({
-        "promptVersion": "dictation-refinement.zh.v17",
-        "context": context,
-        "dictationText": source,
-    }, ensure_ascii=False)
+    user = _build_user_payload(source, language, custom_instructions,
+                               user_dictionary, selection_before, selection_after)
 
     url = api_base.rstrip("/") + "/chat/completions"
     body = json.dumps({
@@ -156,6 +208,9 @@ def refine_text(
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
+        # 关闭思考模式：DeepSeek-V4-Flash 等推理模型默认会先 reasoning_content 再出正文，
+        # 对 Cindy 这套指令明确的润色任务是冗余，关掉可提速 1~2s。
+        **({"thinking": {"type": "disabled"}} if disable_thinking else {}),
     }).encode("utf-8")
 
     req = urllib.request.Request(url, data=body, method="POST")
@@ -197,4 +252,103 @@ def refine_text(
         return {"ok": False, "text": source, "reason": "no_change"}
     if is_diverged(source, refined):
         return {"ok": False, "text": source, "reason": "diverged_too_far"}
+    return {"ok": True, "text": refined, "reason": "ok"}
+
+
+def refine_stream(
+    text: str,
+    api_key: str,
+    api_base: str = "https://ark.cn-beijing.volces.com/api/v3",
+    model: str = "",
+    custom_instructions: str = "",
+    user_dictionary: str = "",
+    selection_before: str = "",
+    selection_after: str = "",
+    language: str = "zh",
+    proxy: str = "",
+    timeout: int = 30,
+    disable_thinking: bool = True,
+    prompt_path: Path = None,
+    on_delta=None,
+) -> dict:
+    """流式润色：纯文本直出，边收边 on_delta(delta) 回调，用于首字即上屏。
+
+    返回 {"ok": bool, "text": str, "reason": str}：
+    - ok=True：text 为完整/部分润色文本（已通过 on_delta 逐段回显）。
+    - ok=False：text 为原文，表示首字前失败（连接/HTTP/网络），调用方应回退整段 refine_text。
+    """
+    source = normalize_text(text)
+    if not source:
+        return {"ok": False, "text": "", "reason": "empty_input"}
+
+    system = _load_stream_prompt(prompt_path or PROMPT_ZH)
+    if not system:
+        return {"ok": False, "text": source, "reason": "prompt_missing"}
+
+    user = _build_user_payload(source, language, custom_instructions,
+                               user_dictionary, selection_before, selection_after)
+
+    url = api_base.rstrip("/") + "/chat/completions"
+    body = json.dumps({
+        "model": model,
+        "stream": True,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        **({"thinking": {"type": "disabled"}} if disable_thinking else {}),
+    }, ensure_ascii=False)
+
+    req = urllib.request.Request(url, data=body.encode("utf-8"), method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "text/event-stream")
+    req.add_header("Accept-Encoding", "identity")
+    req.add_header("Authorization", "Bearer " + api_key)
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    else:
+        opener = urllib.request.build_opener()
+
+    accumulated = ""
+    started = False
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                try:
+                    delta = obj["choices"][0]["delta"].get("content")
+                except Exception:
+                    delta = None
+                if delta:
+                    accumulated += delta
+                    started = True
+                    if on_delta:
+                        on_delta(delta)
+    except urllib.error.HTTPError as e:
+        if started:
+            return {"ok": True, "text": accumulated, "reason": "partial"}
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8")[:300]
+        except Exception:
+            pass
+        return {"ok": False, "text": source, "reason": f"http_{e.code}", "error": detail}
+    except Exception as e:
+        if started:
+            return {"ok": True, "text": accumulated, "reason": "partial"}
+        return {"ok": False, "text": source, "reason": "network", "error": str(e)}
+
+    refined = normalize_output_text(accumulated)
+    if not refined:
+        return {"ok": False, "text": source, "reason": "empty_output"}
     return {"ok": True, "text": refined, "reason": "ok"}

@@ -60,21 +60,29 @@ def record_to_file(out_path: str, stop_event=None, max_seconds: float = 60.0,
         return False, dur, str(e)
 
 
-def record_chunks(stop_event=None, on_level=None, chunk_ms: int = 100):
+def record_chunks(stop_event=None, on_level=None, chunk_ms: int = 100, max_seconds: float = 90.0):
     """流式录音生成器：边录边 yield int16 PCM 块（bytes），供 SAUC 真流式使用。
 
     不写文件；调用方负责把每块实时发往 ASR 或自行累积。
+    max_seconds：达到上限自动停止（与 record_to_file 的 90s 一致，配合
+    pill 80s「还剩10秒」提示；v0.1.18 修复：之前无限录直到松手）。
     用法：
         for pcm in record_chunks(stop, on_level=...):
             ws.send(pcm)
     """
     import numpy as np
     import sounddevice as sd
+    import time as _t
 
     frames = int(SAMPLE_RATE * chunk_ms / 1000)
+    start = _t.time()
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32") as stream:
         while True:
             if stop_event is not None and stop_event.is_set():
+                break
+            if max_seconds and _t.time() - start >= max_seconds:
+                if stop_event is not None:
+                    stop_event.set()
                 break
             data, _ = stream.read(frames)
             rms = float(np.sqrt(np.mean(np.square(data)))) if len(data) else 0.0

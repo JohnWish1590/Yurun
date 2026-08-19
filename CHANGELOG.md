@@ -4,6 +4,338 @@
 
 ---
 
+## [1.0] — 2026-08-19 · 重大版本（端到端管线定型 + 纠错弹窗最终修复）
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/main.py、src/gui.py、src/pill.py、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md
+> **背景**：在 0.1.18d 基础上又经历四/五/六度修复（纠错弹窗崩溃、显示不出来+不能拖动、背景透字），整合为 **v1.0 重大版本**。版本号 0.1.18d→1.0（logger.py `YURUN_VERSION` / yurun_setup.iss `MyAppVersion` 同步）。本版把整条语音听写润色管线端到端定型，并补齐「历史技术演进：用过什么 / 改了什么 / 回退了什么」记录，方便接手者一眼看清全貌。
+
+### 1.0 技术方案总览（用了什么 / 怎么实现）
+
+- **全局热键**：`pynput` 键盘钩子监听 **Ctrl+反引号**（用虚拟键码 `vk=0xC0` 判定，布局/输入法无关，恒定可靠），触发「错误纠正」弹窗；录音热键沿用低级钩子。放弃 `RegisterHotKey`（进程内注册失败、真实错误码被 ctypes 掩盖）。
+- **识别（ASR）**：火山 SAUC **双向流式**端点 `bigmodel`（`show_utterances:true`），边录边发边收中间结果；松手后等 `FLAG_LAST` **最终结果**（不用中间结果提前返回，避免漏松手前最后 1 秒）。`WebSocketApp` 边发边收规避同步 WebSocket 跨线程 race（旧坑：indicator 卡死）。`ws.close(timeout=0.2)` 防 close 握手默认 3s 阻塞。
+- **短句免润色（bypass）**：≤**15 字**（`refiner.BYPASS_MAX_LENGTH=15`）直接贴 ASR 原文秒出、不调 LLM；数字串经 `refiner.strip_numeric_trailing_punct` 剥末尾句号（代码层兜底，因 SAUC 引擎自带标点预测）。
+- **润色（LLM）**：火山方舟 DeepSeek-V4-Flash 接入点（`ep-` ID），**关思考模式**（`thinking.type=disabled`）TTFT≈1s（开思考≈2.4s）；流式 `refine_stream` **首字即上屏**（40ms/字打字机节奏），首字前失败自动回退整段；超时放宽到 30s。
+- **粘贴**：`typer.py` 用 `user32.SendInput` + `KEYEVENTF_UNICODE` **逐字输入，零剪贴板污染**；个别窗口不兼容 SendInput 时切「剪贴板」兜底（`insert_method` 开关）。
+- **词库**：渐进式 `dictionary.py`，Ctrl+反引号弹框存入（正确词+别名+次数）；**三通道生效**——①SAUC 热词直传 `request.context.hotwords`；②bypass 本地替换 `apply_local_replace`；③LLM 词典 `to_llm_text()` 长句润色参考。
+- **录音提示框**：pill 胶囊气泡**停在首次弹出位置固定不动**（v0.1.18 修掉"随鼠标飘"）；单实例锁（`singleinstance.py`）保证永远只有一个进程、新进程杀旧接管。
+
+### 历史技术演进回顾：用过什么 / 改了什么 / 回退了什么
+
+- **流式润色**：v0.1.12 引入「流式首字上屏」（`stream:true` + 关 `json_object`+`stream` 防首字乱码，纯文本 SSE 边收边贴）；v0.1.13 把 ASR 从 `bigmodel_nostream`（非流式，松手后识别约 1s）改成双向流式 `bigmodel`，识别延迟归零。**沿用至今。**
+- **短句免润色 + 15 字阈值**：v0.1.14 把免润色阈值从 8 字提到 **15 字**（`BYPASS_MAX_LENGTH`），更多日常短句秒出；同时修「松手用中间结果漏字」改回等最终结果。**沿用至今。**
+- **固定正在录音提示框**：早期 pill 气泡会**随鼠标/光标移动**（"鼠标走"），v0.1.18 删除 `_maybe_reposition` 轻量重定位，停在首次弹出位置。**沿用至今。**
+- **建立词库**：v0.1.17 新增渐进式词库（Ctrl+反引号纠错框 + 三通道）。**沿用至今。**
+- **粘贴方式演进**：v0.1.9 前走「写剪贴板+Ctrl+V」（污染 Win+V 历史）→ v0.1.7 试「Ctrl+Z 撤原文再贴润色版」（跨 app 误删整段历史，否决）→ v0.1.7 方案B「润色完一次 `paste` 最终文本」→ v0.1.10 起 `typer.py` **SendInput 零剪贴板污染**（最终方案，剪贴板路径降为兜底）。
+- **热键演进**：`RegisterHotKey` 双热键（v0.1.17 尝试，进程内注册失败、错误码被 ctypes 掩盖）→ **pynput 钩子 + vk 0xC0**（v0.1.18 定型，回退掉 RegisterHotKey 路径）。
+- **润色端点**：DeepSeek 官方（TTFT≈5.3s）→ **火山方舟**（v0.1.11，TTFT≈1s）+ 关思考（再省≈1.3s）。**沿用至今。**
+- **数字串去句号**：v0.1.15 改 prompt（纯数字不补句号）→ v0.1.16 发现 SAUC 自带标点、改**代码层 `strip_numeric_trailing_punct` 兜底**（prompt 保留作第一道、代码层为最终防线）。
+- **录音提示框定位**：v0.1.3 锚定焦点窗口矩形（不再跟鼠标飘）→ v0.1.18 进一步停掉录音中轻量重定位（完全固定）。
+
+### v1.0 纠错弹窗最终定型（四/五/六度，详见 0.1.18 章末）
+
+- **四度**：修 `_draw_bg` 里 `canvas.lower()` 无参 `TclError`（tk.Canvas.lower 是 tag_lower 别名，须带 tagOrId；改 `canvas.tk.call('lower', canvas._w)`）；外加 `logger.py` `_report` 调未定义 `_dump` 把真堆栈吞掉，改 `traceback.format_exception` 输出完整堆栈。
+- **五度**：修弹窗"一闪不显示"（设计 AI 放大版 `canvas.pack()`+`body.pack()` 不重叠，body 被窗口高度裁掉；改 `canvas.place` 铺满 + `body.place` 浮上层）；加 **header 拖拽把手**（`<ButtonPress-1>`/`<B1-Motion>` 用 `win.geometry("+x+y")` 移动）。
+- **六度**：修**背景透出背后文字**（body 原 `bg=TRANSPARENT` 浮在 canvas 上，中间缝隙透字；改 body 不透明白底 `#FFFFFF` + 内缩 8px，窗口高度 +16px，四角仍圆、中间完全遮住）。
+
+### 行为变化
+
+- 版本号 0.1.18d→**1.0**；启动 banner 显示「语润 v1.0」。
+- 纠错弹窗：不透明白底完全遮住背后内容、四角圆、可拖动。
+- 其余行为同 0.1.18d（pynput 钩子 / 4 字错误文案 / 气泡固定 / 短句 bypass / 流式润色 / 零剪贴板粘贴 / 词库三通道）。
+
+---
+
+## [0.1.18] — 2026-08-18 · 纠错热键改 pynput 钩子 + 错误文案 4 字 + 气泡停位
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/main.py、src/hotkey.py、src/pill.py、src/logger.py、installer/yurun_setup.iss、Yurun.spec、CHANGELOG.md
+> **背景**：用户实测 v0.1.17 修复版：①Ctrl+反引号仍无反应（日志 07:07:55「纠错热键注册失败（Ctrl+`），错误码 0」）；②错误气泡字多带省略号（要求统一 4 字 + 红感叹号）；③「正在录音/识别」气泡会随鼠标/光标移动（要求停在首次弹出位置）。诊断（独立测试）：系统层面 Ctrl+反引号可注册、先主键后组合键顺序无冲突、无修饰热键在带 Ctrl 时不会误触发录音——即 RegisterHotKey 路径理论可行，但语润进程内注册失败且真实错误码被 ctypes 掩盖（windll 未开 use_last_error）。放弃 RegisterHotKey 第二热键，改用 pynput 全局键盘钩子。
+
+### 改动点
+
+- **纠错热键改 pynput 钩子**（`main.py`）：`hotkey.py` 回滚第二热键改动（start_correct/_window_ready/on_correct 全删，恢复单热键）。`run()` 启动 `pynput.keyboard.Listener`，`_kb_on_press/_kb_on_release` 检测 Ctrl+反引号组合（防重复触发：触发后等反引号释放才复位）→ `_on_correct_key` → 弹「错误纠正」框。启动日志 `纠错热键监听已启动: Ctrl+`（pynput）`。
+- **错误文案统一 4 字**（`main.py`）："没听到声音"→"识别失败"（用户明确）、"模块加载失败"→"模块失败"、"没识别到内容"→"没识别到"、"词库加载失败"→"词库失败"。红感叹号图标上版已画（canvas 圆+!，不占文本空间）。
+- **气泡停止随动**（`pill.py`）：删除 `_tick` 里录音/润色的 800ms 轻量重定位（`_maybe_reposition`），状态窗口停在首次弹出位置直到本次结束。
+- **版本号 0.1.17→0.1.18**：logger.py、yurun_setup.iss 同步；spec hiddenimports 补 `pynput`、`pynput.keyboard`。
+
+### 验证
+
+- py_compile 通过；pynput import 与 `<ctrl>+`` 解析 OK（系统 Python 3.12.2）。
+- 独立测试已证：无修饰反引号热键在带 Ctrl 按下时**不触发**（录音/纠错两键位共存安全）。
+
+### v0.1.18 修复（07:30 重打包，同版完善）
+
+- **pynput 钩子检测不到 Ctrl+反引号**（用户实测仍无反应；日志确认钩子已启动但无触发）：根因 `_kb_on_press` 用 `key.char == "`"` 判断反引号键，**char 受键盘布局/输入法影响**（中文输入法下反引号键 char 可能是「·」而非「`」）→ 改**用 vk（虚拟键码 0xC0）判断**，布局无关、恒定可靠。
+- **提示字体不统一**（用户要求"所有提示按正在录音统一"）：`show_error`/`show_guide` 从 13px（FONT_GUIDE）改 15px（FONT），`ERROR_FONT_SIZES` 起点同步 15px；全部状态提示统一 15px。
+- **说明（非 bug）**：changelog 识别成"change log"是词库为空所致——纠错弹窗此前从未成功弹出，词库没有 changelog 词条，热词/替换自然不生效；修好纠错键、存一次词条后生效。
+
+### v0.1.18 修复二（08:40 重打包，同版完善）
+
+- **纠错弹窗"没反应"真根因**（用户实测 WorkBuddy 里 Ctrl+反引号无反应；日志 08:25:10~25 十次「纠错热键触发」+ 十次 `UI 事件处理失败: wrong # args: ....canvas raise tagOrId`）：Apple 风格重写时误写 `canvas.lift()`——**tk.Canvas 的 lift 是 item 方法（需 tagOrId 参数）**，无参调用抛异常，弹窗创建后永远卡在隐藏态不显示。修复：删除该行（body 后创建本就在 canvas 上层）。
+- **焦点锁定 C1**（用户核心需求"固定产生文字的框"）：`_on_hold_start` 用 GetForegroundWindow + GetGUIThreadInfo 记录目标输入控件 hwnd；`pump` 每 40ms 检查，焦点被切走 0.4s 后 `AttachThreadInput + Alt keybd_event + SetForegroundWindow` 抢回；`done`/`error` 事件释放锁定。
+- **录音超时逻辑**：① `pill.STATE_TIMEOUT` 删除 recording 40s 假报错（与 max_seconds=90 矛盾）；② 录音 80s 时气泡切感叹号图标 +「还剩10秒」（不切状态，90s 自然终止）；③ **`recorder.record_chunks` 加 max_seconds=90 自动停止**（v0.1.18 之前 SAUC 真流式无限录直到松手——"超时跳了还能继续录"的另一半原因），`main._record_job_sauc` 传 max_seconds=90。
+- **短句策略**：bypass 原样贴 ASR 原文（用户确认不改策略；"测试"说三遍只出一遍是 SAUC 连续发音合并的引擎行为，非程序干预）。
+
+### v0.1.18 修复三（18 重打包，同版完善）
+
+- **纠错弹窗字体统一 15px**（`main.py` `_show_correction_dialog`）：标题/识别文本/正确写法/输入框/按钮/状态文案全部从 9~11px 升到 15px，与「正在录音/正在润色」状态提示（`pill.FONT = ("Microsoft YaHei UI", 15)`）完全一致；弹窗尺寸 340×172 放大到 360×220 容纳。
+- **选中文字 + Ctrl+反引号 自动复制（方案A，零剪贴板污染）**（`main.py`）：按 Ctrl+反引号时不再要求用户先 Ctrl+C——弹窗显示前（`win` 仍 withdraw、焦点在外部 app）先 `_clipboard_backup()` 备份用户原剪贴板 → `_send_ctrl_c()` 发 Ctrl+C 把选中内容送进剪贴板 → `time.sleep(0.08)` 读选中文本填「识别文本」→ `_clipboard_restore()` 把原内容写回剪贴板。效果：用户选中几个字、直接按 Ctrl+反引号，弹窗里就是那几个字，且**原剪贴板内容不丢**（复用 v0.1.x「避免污染剪贴板」思路：过去是输出侧用 SendInput 跳过剪贴板，本次是读取侧用备份/恢复）。
+- **版本号 0.1.18→0.1.18d**：logger.py、yurun_setup.iss 同步。
+
+### v0.1.18d 字体放大版（08-19 重打包，按《hy3全套指令-字体放大版》）
+
+> **背景**：用户实测设置界面「字体太小了，根本看不清」——上一版沿用了 macOS 默认 12–14px，在 Windows 125%–150% 缩放下过小。按放大版指令把正文锚定到 16px、其余按比例放大，颜色/圆角/胶囊/交通灯/分段控件规则一律不变。
+
+- **设置窗口字号整体放大**（`gui.py`）：F_TITLE 34→**40**、F_CARD 17→**20**、F_SUB 15→**17**、F_ROW 15→**17**、F_LABEL 13→**15**、F 14→**16**、F_SMALL 12→**14**、F_LINK 13→**15**、F_SEG 13→**15**、F_BTN 14→**16**（数值与放大版字号表一一对应）。
+- **配套尺寸放大**（`gui.py`）：窗口宽 580→**600**；标题栏 38→**42**；交通灯 12→**13**；卡片内边距 20→**24**；分段控件内边距 14→**16**、容器内边距 3→**4**、默认高 32→**36**；按钮默认高 38→**42**；热键框新增 F_HOTKEY=**19**（72×42 观感）；内容区内边距 32→**36**、顶部 0→**12**、底部 32→**36**。
+- **错误纠正弹窗字号放大**（`main.py` `_show_correction_dialog`）：标题 20→**24**、副标题 14→**16**、区块标签 13→**15**、识别文本内容 15→**17**、输入框 15→**17**、状态/按钮 13→**16**；弹窗高 340→**360**、内边距 28/24→**32/24**、只读框/输入框高 46→**52**、观感更宽松。
+- **仍 0.1.18d**（仅界面放大，功能无变化）：logger.py / yurun_setup.iss 版本号不变。
+
+### v0.1.18d 像素级复刻修正（08-19 二度重打包，按《hy3纠错指令-Apple风格.md》）
+
+> **背景**：用户实测「严重偏离设计稿」。逐条比对 HTML 参考稿，定位到 4 类结构性偏差，全部修正（HTML 为准，文字规范冲突时以 HTML 为准）。
+
+- **致命：衬线字体根因**（`gui.py`）：`FONT` 原是**字体元组** `("SF Pro Text","SF Pro Display","PingFang SC","Microsoft YaHei")`，又被当作 `font=(FONT, size, weight)` 使用 → 嵌套元组导致 Tkinter 字体解析错乱、回退到系统默认（"语润"呈衬线）。改为**单一字符串** `FONT = "Microsoft YaHei UI"`（Windows 回退即该无衬线字体，与 pill 一致）；所有 `font=(FONT, ...)` 现在都是合法 `(family, size, weight)` 元组。
+- **字段布局：标签在上、输入框在下**（`gui.py` `_field`）：原为 `side="left"/side="right"` 并排（违反 HTML `.field-group` flex column）。改为 grp 内 label 占一行、input 在下一行（label margin-bottom 10px）、desc 在 input 下（margin-top 8px）。
+- **卡片 header 同行**（`gui.py` `Card` + `_card_header`）：原卡片标题画在 canvas 顶部、分段控件堆在标题下方（上下）。重构 `Card` 去掉 canvas 标题，新增 `_card_header(card, title, right=)` 在 body 首行放「标题左 + 分段右」（`justify-content: space-between`），完全对齐 HTML `.card-header`。
+- **去三角 + 去多余说明**：高级链接由 `▸/▾ 高级（…）` 改为纯文字 `高级（…）`（规范禁止 ▶ 三角）；热键下「默认反引号（`），位于 Tab 上方」说明文字删除（规范禁止），只留「热键」+ 白色圆角输入框（72×42 观感，19px 居中）。
+- **验收清单逐项对照**：无衬线标题 ✓ / 三个白卡 ✓ / 云端火山·本地离线胶囊分段 ✓ / API Key 标签在上 ✓ / 热键白框 ✓ / 触发·粘贴胶囊分段 ✓ / 取消左保存右胶囊 ✓ / 正确写法输入框完整边框 ✓。
+- 仍 0.1.18d（仅视觉，功能无变化）。
+
+### v0.1.18d 纠错弹窗崩溃修复（四度，prev7 重打包）
+
+- **根因 1（主因/`main.py` `_draw_bg`）**：设计 AI 放大版 `_draw_bg` 里写 `canvas.lower()` 无参。Tkinter 中 `tk.Canvas.lower` 被别名成 `tag_lower`（降 canvas 内部图元，必须带 tagOrId），无参调用 → `TclError: wrong # args`，热键一触发即崩、弹窗永远卡在隐藏态。修复：`canvas.lower()` → `canvas.tk.call('lower', canvas._w)`（Widget 级 lower 正确调用，绕过别名；body 后创建本就在上层，z 序不变）。
+- **根因 2（次因/`logger.py` `_report`）**：`_report` 调了未定义的 `_dump(...)`，Tk 回调异常时二次抛 `NameError` 把真实堆栈吞掉，排错时只见 `wrong # args` 反复出现却找不到来源。修复：改用 `traceback.format_exception` 把真实堆栈写进 `yurun.log`，以后任何 Tk 错误都能看见根因。
+- 用户明确"bug 修掉、设计先不动"——只改这 2 处，不碰设计 AI 的布局。
+
+### v0.1.18d 纠错弹窗「显示不出来 + 不能拖动」修复（五度，prev8 重打包）
+
+- **显示根因**：设计 AI 放大版用 `canvas.pack()` + `body.pack()` 上下排布（不重叠）。canvas 占顶部一条、white 的 body 被窗口高度裁掉 → 只看到透明/错位、内容全无。正确写法对齐 `pill.py`：canvas `place` 铺满窗口作圆角白底、body `place` 浮在上层且 `bg=TRANSPARENT`（四角由 canvas 圆角呈现、body 不挡四角）。
+- **拖动**：`overrideredirect` 无标题栏，新增 **header 拖拽把手**：`header` Frame（cursor=fleur）绑 `<ButtonPress-1>`/`<B1-Motion>`，用 `win.geometry("+x+y")` 移动窗口；标题/副标题移入 header。
+- 仍 0.1.18d（仅修复，视觉样式原样未动）。
+
+### v0.1.18d 纠错弹窗「背景透出背后文字」修复（六度，prev9 重打包 → 整合为 v1.0）
+
+- **根因**：body 此前是 `bg=TRANSPARENT` 浮在 canvas 之上，弹窗中间缝隙透出背后文字（白底下正常、有文字背景下透出）。用户要求"对齐问题和需求再改"。
+- **修复**：body 改为不透明白色 `#FFFFFF` + 内缩 8px（`place(x=8,y=8,width=W2-16,height=H2-16)`），浮在 canvas 圆角白底之上；`_place` 窗口高度多给 16px（`H2 = body.winfo_reqheight() + 16`）。外圈 8px 露出 canvas 圆角白底形成圆角边框，中间完全不透明、遮住背后内容。
+- 此轮即 v1.0 整合前的最后一轮修复；版本号随整合升到 **1.0**（见 [1.0] 章）。
+
+### 行为变化
+
+- Ctrl+反引号弹「错误纠正」框（pynput 钩子，不再依赖 RegisterHotKey）。
+- 错误气泡统一 [红感叹号] + 4 字短文案。
+- 「正在录音/识别/润色」气泡停在首次位置，不随鼠标移动。
+- 「错误纠正」弹窗字体与状态提示统一 15px；选中文字后直接 Ctrl+反引号自动填入，不必先 Ctrl+C。
+
+---
+
+## [0.1.17] — 2026-08-18 · 渐进式词库（纠错快捷键）+ 气泡错误图标修复
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/dictionary.py（新增）、src/hotkey.py、src/main.py、src/pill.py、src/sauc_asr.py、src/config.py、src/logger.py、installer/yurun_setup.iss、Yurun.spec、CHANGELOG.md
+> **背景**：用户要"越用越聪明"的词库——说"千机 log"识别成"天气 log"（实为 changelog），多次纠正后自动记住。查 Cindy 源码（makecindy/cindy voice-input 模块）确认其机制：上屏后监视编辑器 transaction → 检测用户修改刚上屏文本 → 停改 15s 后 LLM advisor 判断 → 自动存词条（正确词+别名+次数）+ Toast 可删除。但 Cindy 能"感知修改"是因为文本在**它自己的编辑器**里；语润 SendInput 打进外部应用，**无法感知用户事后修改**，只能靠用户主动告知 → 用户拍板：B 为主（纠错快捷键 Ctrl+反引号）+ A 辅助（后续 GUI 词库页），手动确认式，词库规模小，热词+本地替换双保险。另修复：气泡错误提示带"⚠ "文本前缀，⚠ 在 Windows 渲染成 emoji 挤压文字导致「识别失败」显示不完整。
+
+### 改动点
+
+- **新增 `src/dictionary.py` 词库模块**：存储 `%APPDATA%\Yurun\user_dictionary.json`；词条结构 `{text(正确词,唯一), aliases[{text,count}], count, source}`；API：add_entry（正确词+错误变体累积去重、count 递增）/delete_entry/to_hotwords（按 count 降序，≤180 字符预算）/apply_local_replace（bypass 替换，别名按长度降序）/to_llm_text（userDictionary 文本）。
+- **纠错热键 Ctrl+反引号**：`hotkey.py` 扩展第二热键（RegisterHotKey id=2，MOD_CONTROL|MOD_NOREPEAT），`config.py` 加 `correction_hotkey`（默认 `）;main.py 触发 `show_correction` 事件。
+- **「错误纠正」弹窗**：`main.py` `_show_correction_dialog`——识别文本自动读剪贴板（可编辑）+ 正确写法输入框 + 存入词库/取消；确认后显示「已存入词库：xxx」1.2s 自动关；回车确认、Esc 取消。
+- **三通道生效**：①ASR 热词——`sauc_asr.py` `_build_full_request` 加 `request.context.hotwords` 直传，`sauc_transcribe_stream`/`sauc_transcribe` 透传 hotwords，main 从词库取；②bypass 本地替换——`_after_transcribe` 剥句号后 `apply_local_replace`（短句直通路径兜底）；③LLM 词典——`_refine`/`_refine_stream_and_paste` 传 `user_dictionary=to_llm_text()`（长句润色参考）。
+- **气泡错误图标修复**：`pill.py` 去掉 `"⚠ "` 文本前缀（⚠ emoji 渲染挤压文字致「识别失败」显示不全），改画圆底感叹号（canvas 圆+“!”）固定位置不占文本空间；`show_error` 文本左对齐 + `_fit_error_text` 超宽截断兜底。
+- **版本号 0.1.16→0.1.17**：logger.py、yurun_setup.iss 同步；spec hiddenimports 加 `dictionary`。
+
+### 验证
+
+- py_compile 通过；dictionary 单测（新增/别名累积/热词列表/替换映射）待打包前跑。
+- 热词为火山 SAUC `request.context` 直传（≤200 tokens），英文词（changelog）效果需实机验证，bypass 本地替换为确定性兜底。
+
+### 行为变化
+
+- Ctrl+反引号 弹「错误纠正」框：识别文本自动读剪贴板，填正确写法确认即入词库。
+- 词库生效：下次识别走热词（源头）+ 短句 bypass 本地替换 + 长句 LLM 词典。
+- 错误提示气泡：圆底感叹号图标 + 纯文本消息，任何长度完整显示。
+
+### v0.1.17 修复（07:06 重打包，同版完善）
+
+- **纠错热键注册失败**（用户实测 Ctrl+反引号无反应）：根因 `hotkey.start()` 异步建窗（后台线程），`run()` 里 start 后立即 `start_correct()` 时 `_hwnd` 还是 None → 静默 return False，热键从未注册。修复：`HotkeyListener` 加 `_window_ready` 事件，窗口创建后 set；`start_correct` 等待窗口就绪（≤3s）再注册，失败打 warning 日志（不再静默）。
+- **错误气泡"字多+省略号"**（用户实测"没听到声音，再试一次"被截成"没听到声音…"）：①错误文案缩短——"没听到声音，再试一次"→"没听到声音"、"SAUC 模块加载失败"→"模块加载失败"（全部 ≤6 字，86px 内放下不触发截断）；②`_fit_error_text` 改为**字体缩小优先**（13→11→10px，放得下就不截断、不加省略号），仅 10px 仍超宽才截断兜底。
+
+---
+
+## [0.1.16] — 2026-08-18 · 数字串去句号改代码层（ASR 自带标点）
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/refiner.py、src/main.py、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md
+> **背景**：v0.1.15 按方案 A 改 prompt（数字不补句号）后用户实测纯数字/手机号/订单号**仍加句号**。查 `%APPDATA%\Yurun\logs\yurun.log` 实锤根因：**火山 SAUC ASR 引擎自带标点预测，识别原文就带句号**——日志 `识别结果: 12345。`、`识别结果: 13382513336。`、`识别结果: 1234567。`。短句（≤15 字）走免润色 bypass 直接贴 ASR 原文，**根本没调 LLM**，改 prompt 完全无效。之前"12345 被 LLM 加句号"的判断不完整：即使走 LLM 是 prompt 的锅，短句场景纯属 ASR 端。
+
+### 改动点
+
+- **`refiner.py` 新增 `strip_numeric_trailing_punct()`**：末尾是标点 且 文本数字占比 ≥ 60%（数字为主）→ 剥掉末尾标点；正常句子（数字占比低）保留。覆盖纯数字/手机号/订单号/日期等编号类场景。
+- **`main.py` 三处接线**：① `_after_transcribe` 入口拿到 ASR 文本后先剥（bypass 主路径——问题核心）；② 非流式润色 `final` 输出再剥一次（LLM 不遵守 prompt 时兜底）；③ 流式失败回退整段的 `final` 同样剥。流式 on_delta 动态贴出不处理（只有长句走流式，数字占比高的长句罕见，prompt 规则已兜）。
+- **版本号 0.1.15→0.1.16**：`logger.py`、`yurun_setup.iss` 同步。
+
+### 验证
+
+- `strip_numeric_trailing_punct` 9 用例全过：`12345。`→`12345`、手机号、`订单号20260818。`、`2026年8月18日。` 均剥句号；`今天早就要去生活，嗯，对。`、`第3季度营收100亿。` 正常句子保留句号。
+- py_compile 通过；重新打包 `dist/语润.exe`（约 71.4MB）。
+
+### 行为变化
+
+- 纯数字/手机号/订单号/日期等数字为主的文本，末尾不再带句号（无论 bypass 还是润色路径）。
+- 正常句子照旧保留标点。v0.1.15 的 prompt 修改保留（LLM 路径第一道防线，无害）。
+
+---
+
+## [0.1.15] — 2026-08-17 · 数字串/编号不补句号
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：prompts/refine-dictation.zh.txt、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md
+> **背景**：用户实测纯说「12345」也会被润色 LLM 在末尾补句号。标点补全逻辑完全由润色提示词驱动（prompts/refine-dictation.zh.txt 第 36 行「添加标点…」），代码层无任何标点规则。即便短句本应 bypass 不调 LLM，一旦因自定义指令或 ASR 原文带点导致走润色，LLM 就会按 prompt 把数字串当句子补句号。用户要求加硬性规则：数字串/编号/密码结尾不补句号。
+
+### 改动点
+
+- **prompts/refine-dictation.zh.txt 三处加固**：① 第 36 行「添加标点」段补「纯数字串、编号、密码、连续数字结尾不补句号」；② 硬性禁止段新增一条「不要给纯数字串/编号/密码结尾补句号（如 12345 原样返回）」，优先级最高（连自定义指令也覆盖不了）；③ 简短示例段新增反例「12345」->「12345」。流式与非流式两条润色路径共用同一 base prompt，均生效。
+- **版本号 0.1.14→0.1.15**：`logger.py`、`yurun_setup.iss` 同步。
+
+### 验证
+
+- py_compile 通过；重新打包 `dist/语润.exe`（约 71.4MB），二进制内确认新规则（`12345` 示例）已嵌入。
+
+### 行为变化
+
+- 走 LLM 润色的文本，若末尾是纯数字串/编号/密码，不再补句号；正常句子仍按原规则补标点。
+
+---
+
+## [0.1.14] — 2026-08-17 · 免润色阈值 8→15（短句秒出）
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/refiner.py、src/main.py、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md
+> **背景**：用户实测短句（≤8 字免润色）秒出、长句（>8 字）要等方舟润色 1~8s，体感差异大。方舟润色速度波动（1~8s）是长句慢的根源，预热无效（实测连续 3 次无 cache 递减）。故提高免润色阈值，让更多日常短句直接贴原文秒出。
+
+### 改动点
+
+- **免润色阈值 8→15 字**：`refiner.py` 新增 `BYPASS_MAX_LENGTH=15` 常量，`_should_bypass_llm` 与 `main.py` `_refine_will_change` 均引用之。15 字以内短句不再调 LLM，直接贴 ASR 原文（秒出）。
+- **修复「松手即用中间结果」漏字**：`sauc_transcribe_stream` 松手后改回等最终结果（FLAG_LAST），不再用中间结果提前返回——中间结果缺最后一段音频识别，短句免润色时会把松手前最后 1 秒的话漏掉（用户实测发现）。
+- **版本号 0.1.13→0.1.14**：`logger.py`、`yurun_setup.iss` 同步。
+
+### 验证
+
+- py_compile 通过。
+
+### 行为变化
+
+- 15 字以内的短句不再润色（不补标点/不整理），直接出原文；长句仍润色。
+
+---
+
+## [0.1.13] — 2026-08-17 · 流式识别（边录边识别，松手立即润色）
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/sauc_asr.py、src/config.py、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md
+> **背景**：续 [0.1.12] 流式润色，用户提出「能不能边录音边上传边润色」。查证火山 SAUC 端点：当前用 `bigmodel_nostream`（非流式输出，等说完才返回结果，松手后识别约 1s），改用双向流式 `bigmodel` 端点可边听边出中间结果，识别重叠到录音期。真正「边识别边润色」暂不做（中间文本不稳定会打错字），本版先把识别挪进录音期。
+
+### 改动点
+
+- **端点 `bigmodel_nostream` → `bigmodel`**（双向流式）：`config.py` DEFAULTS + 用户本地 `config.json` 同步；`sauc_asr.py` 两处 endpoint 默认值。
+- **加 `show_utterances: true`**：`_build_full_request` 让服务端返回实时中间结果。
+- **`sauc_transcribe_stream` 改 WebSocketApp 回调模式**：边录边发 + 边收中间结果（on_message 在 run_forever 线程、send 在录音线程），规避同步 WebSocket「跨线程 send/recv」竞争（之前导致 indicator 卡死的坑）；中间结果只攒着不回显（避免文字跳变），松手后等 FLAG_LAST 最终结果。
+- **补 `Thread.isAlive` 兼容别名**：websocket-client 0.57 内部用 `isAlive()`，Python 3.12 已移除（改为 is_alive），不补则 `run_forever` 抛 AttributeError。
+- **松手即用中间结果（识别延迟归零）**：松手后不再死等 FLAG_LAST 最终结果，改为「0.35s 宽限期——优先等最终结果，超时则用当前最新中间结果」；`ws.close(timeout=0.2)` 修复 close 握手默认 3s 阻塞（否则松手后偶发卡 2.7s）。
+- **版本号 0.1.12→0.1.13**：`logger.py`、`yurun_setup.iss` 同步。
+
+### 验证
+
+- 静音 3 秒喂 `sauc_transcribe_stream`：连接 + 边发边收 + FLAG_LAST 结束正常，无 race/卡死。
+- 合成中文语音（pyttsx3 Huihui「今天天气很好我们去公园散步买了很多东西」）实测 4 次：松手后识别延迟 0.05~0.06s，返回文本完整（含标点），识别延迟近乎归零；加 `close(timeout=0.2)` 前偶发 2.7s 阻塞（close 握手默认 3s）。
+- 改动文件 py_compile 通过。
+
+### 行为变化
+
+- 松手后延迟：识别从「松手后完整识别 ~1s」降到「已边听边识别、松手后仅尾部定稿 <0.3s」，再进流式润色；长句收益更大。
+- 录音期间保持 WebSocket 长连接（联网时机从「松手后」前移到「说话时」），用户无感。
+
+---
+
+## [0.1.12] — 2026-08-17 · 流式首字上屏（润色边出边贴）
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/refiner.py、src/main.py、src/config.py、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md
+> **背景**：续 [0.1.11] 提速，用户实测关 thinking 后仍觉出字慢。读 Cindy 源码确认其润色是「纯在线 + 流式首字上屏 + 录音期预热」，快在工程层而非模型本身。本版复刻「流式首字上屏」：润色结果边生成边 SendInput 输入，首字即上屏，不再等整段 JSON 回包。预热暂不做（DeepSeek/方舟 prompt cache 按前缀自动命中，预热仅对首次有增量且每次多一次计费，性价比低）。
+
+### 改动点
+
+- **流式润色 `refine_stream()`**：`refiner.py` 新增纯文本流式（`stream:true` + 关 thinking + `Accept: text/event-stream` + `Accept-Encoding: identity`），边收 SSE `delta` 边 `on_delta` 回调；system prompt 沿用 Cindy 原 prompt 精华，仅把「输出要求」段替换为纯文本直出（`_load_stream_prompt`），避免边流边拼 JSON 的首字乱码问题。
+- **首字即上屏接线**：`main.py` 新增 `_refine_stream_and_paste`，`on_delta` → `ui_q` 的 `type_partial` 事件 → 主线程 `_do_type` 逐段 SendInput；首字前失败（连接/HTTP/网络）自动回退整段 `refine_text`（此时尚未贴字，安全）。
+- **固定前缀顺序**：`_build_user_payload` 提取为共用 helper，字段顺序稳定（promptVersion/context 稳定字段在前、dictationText 易变字段最后），配合端点自动 prompt cache 命中。
+- **配置开关**：`config.refine_streaming`（默认 True）可关流式回退整段；流式仅在 `insert_method=type`（SendInput）时启用，paste 模式保持整段。
+- **逐字打字节奏（打字机效果）**：`typer.py` `type_text` 加 `char_interval` 参数（>0 时逐字投递 + sleep），`main.py` 流式 `_do_type` 用 `char_interval=0.04`（40ms/字）。此前模型生成多快就贴多快，短句生成 <0.5s、分片间隔太短，人眼感知不到「逐字」，观感仍是「整段蹦出」；现在固定 40ms/字节奏，文字像打字机逐字冒出。
+- **修复 show_transcribing 缺失**：`pill.py` 补 `show_transcribing` 方法（「⟳ 正在识别」态）。此前 `main.py` 每次松手都抛 `AttributeError: 'PillBubble' object has no attribute 'show_transcribing'`（识别等待期的 pill 状态一直没实现）。
+- **版本号 0.1.11→0.1.12**：`logger.py`、`yurun_setup.iss` 同步。
+
+### 验证
+
+- 改动文件 `py_compile` 通过。
+
+### 行为变化
+
+- 长句润色从「等整段回包再一次性贴」改为「首字即出、边润边贴」，打字速度随模型生成实时推进。
+- 流式遇断流保留已贴部分（partial）不再重贴；首字前失败自动回退整段，体验与旧版一致。
+- 发散护栏 `is_diverged` 在流式路径不做事后撤回（边贴边出无法撤销），但短句已被 `_refine_will_change` 过滤、关 thinking + Cindy 强约束下跑偏概率极低。
+
+---
+
+## [0.1.11] — 2026-08-17 · 润色端点迁火山方舟 + 关思考 + 超时30s
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/config.py、src/main.py、src/refiner.py、src/gui.py、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md
+> **背景**：续 [0.1.2]/[0.1.7] 出字速度讨论，DeepSeek 官方端点 TTFT≈5.3s 偏慢。实测火山方舟 DeepSeek-V4-Flash 接入点（带 `ep-` 的推理接入点 ID）TTFT≈1s、整句润色 ≈1.1s（关思考）/2.4s（开思考）；且其 `message["content"]` 可直接解析，Yurun 现有 OpenAI 兼容逻辑无需改动即兼容。用户要求切换并提速。
+
+### 改动点
+
+- **润色端点默认迁火山方舟**：`config.py` `api_base` 默认改 `https://ark.cn-beijing.volces.com/api/v3`，`api_model` 默认留空（提示填 `ep-` 接入点 ID）；用户本地 `config.json` 已写入真实接入点 `ep-20260817122432-jpl9q` 与方舟 key。GUI 红圈区标签由「DeepSeek 开放平台 API Key（sk- 开头）」改为通用「润色 API Key（OpenAI 兼容，sk-/ark- 等均可）」；高级项默认 Base URL 预填方舟、模型留空。
+- **关思考模式（默认开）**：`refiner.py` 请求体新增 `"thinking": {"type": "disabled"}`（受 `config.disable_thinking` 控制，默认 `True`）。针对 Cindy 这套指令明确的润色任务，模型「内心戏」是冗余，关掉实测提速约 1.3s（2.4s→1.1s）且 `reasoning_content` 不再出现；真需质量可改 `disable_thinking:false` 还原。
+- **润色超时 10s→30s**：`refiner.py` `timeout` 默认改 30（受 `config.refine_timeout` 控制），长句 / 网络波动不再轻易触发 `timeout` 失败回退原文。仅放宽上限，正常该 1~2s 完成仍是 1~2s。
+- **版本号 0.1.10→0.1.11**：`logger.py` `YURUN_VERSION`、`installer/yurun_setup.iss` `MyAppVersion` 同步。
+- 新增 config 字段：`disable_thinking`（bool，默认 True）、`refine_timeout`（int，默认 30）。
+
+### 验证
+
+- 用真实方舟 key 精确复刻 `refiner.py` 请求（json_object + thinking 关闭 + 非流式）：耗时 1.07s，`reasoning_content` 不存在，`content` 正确解析为 `{"text": "今天去超市买了很多东西。"}`。
+- 改动文件 `py_compile` 通过。
+
+### 行为变化（对协作同学说明）
+
+- 默认润色端点从 DeepSeek 官方切到火山方舟；新装用户需自己建一个 `ep-` 接入点填进「模型」框。
+- 思考模式默认关闭（更快），非推理类润色无感；若发现复杂长文润色质量下降，把 `disable_thinking` 改 false。
+- 润色等待上限放宽到 30s，故障回退等待也随之变长。
+
+---
+
+## [0.1.10] — 2026-08-17 · 修复 SendInput 类型错误（0.1.9 仍污染剪贴板的真因）
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/typer.py、src/logger.py、installer/yurun_setup.iss
+> **背景**：0.1.9 宣称零剪贴板污染，但用户实测剪贴板历史仍被写入。查 0.1.9 日志发现 `typer.py` 每次 `SendInput` 抛 `TypeError`（传入 `ctypes.byref(arr)` 得到的是 `LP_INPUT_Array_N`，而 `SendInput` 期望 `LP_INPUT`），异常被 `_do_paste` 捕获后回退「写剪贴板 + Ctrl+V」，于是污染照旧。
+
+### 改动点
+
+- **typer.py 修复类型**：`ctypes.byref(arr)` → `ctypes.cast(arr, ctypes.POINTER(INPUT))`，实测 `type_text('hi')` 返回 4，投递成功。
+- **版本号 0.1.9→0.1.10**：`logger.py`、`yurun_setup.iss` 同步。
+- 保留 `dist/语润-v0.1.9.exe`（坏版本，备查）与 `dist/语润-v0.1.8.exe`（原版回退）。
+
+### 验证
+
+- 用户退出 dev 模式 Python、双击 v0.1.10 exe 启动后确认：「还真是可以了」。日志实锤：`SendInput 已投递 60 字（type 模式，零剪贴板污染）`，全程无「剪贴板已写入 / Ctrl+V / 回退」任一条。
+- **v0.1.10 = 语润首次真正实现零剪贴板污染粘贴**。
+
+### 行为变化
+
+- 仅修内部调用类型，无接口变化；`insert_method=type` 路径这下才真正生效。
+
+---
+
 ## [0.1.9] — 2026-08-17 · 零剪贴板污染粘贴 + 录音90秒 + 拿掉识别/润色超时
 
 > **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）

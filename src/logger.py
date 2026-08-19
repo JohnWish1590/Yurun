@@ -15,7 +15,7 @@ import traceback
 from pathlib import Path
 
 APP_NAME = "Yurun"
-YURUN_VERSION = "0.1.10"
+YURUN_VERSION = "1.0"
 
 # 全局 Tk root 引用（由 main 在创建后注册），用于捕获 Tk 回调异常
 _tk_root = None
@@ -106,10 +106,11 @@ def register_tk_error(root):
     _tk_root = root
     try:
         def _report(*args):
+            log = get_logger("yurun")
             if len(args) >= 3:
-                _dump("tk", args[0], args[1], args[2])
+                import traceback as _tb
+                log.error("Tk 回调异常:\n%s", "".join(_tb.format_exception(args[0], args[1], args[2])))
             else:
-                log = get_logger("yurun")
                 log.error("Tk 回调异常: %r", args)
         root.report_callback_exception = _report
     except Exception:

@@ -7,6 +7,7 @@
 
 日志：%APPDATA%\\Yurun\\logs\\yurun.log
 """
+import ctypes
 import os
 import queue
 import sys
@@ -16,6 +17,10 @@ import tkinter as tk
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# 焦点锁定用（录音时把输入焦点固定在开始时的目标窗口）
+_user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
 
 from config import get_config
 from hotkey import get_hotkey
@@ -51,6 +56,14 @@ class App:
         self._rec_thread = None
         self._paste_cb = None              # 等待粘贴的回调
         self._round_seq = 0                 # 每次按下热键 +1，用于作废过期的后台润色
+        # pynput 纠错热键状态（Ctrl+反引号）
+        self._kb = None
+        self._kb_listener = None
+        self._kb_ctrl = False
+        self._kb_correct_fired = False
+        # 焦点锁定（C1）：录音开始时锁定目标输入控件，切走自动抢回
+        self._target_hwnd = None
+        self._last_steal = 0.0
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -80,6 +93,17 @@ class App:
                 self._handle_ui(evt)
         except queue.Empty:
             pass
+        # 焦点锁定：录音/输入期间若焦点被切走，抢回录音开始时的目标窗口
+        # （用户要"固定产生文字的框"——字必须打进开始录音时所在的输入框）
+        if self._target_hwnd and not self._quit:
+            now = time.time()
+            if now - self._last_steal > 0.4:
+                try:
+                    if _user32.GetForegroundWindow() != self._target_hwnd:
+                        if self._steal_focus(self._target_hwnd):
+                            self._last_steal = now
+                except Exception:
+                    pass
         self.indicator._tick()
         if not self._quit:
             self.root.after(40, self.pump)
@@ -88,9 +112,7 @@ class App:
         kind = evt[0]
         try:
             if kind == "guide":
-                hk = (self.cfg.get("hotkey") or "`").strip()
-                label = "` 键" if hk in ("`", "~") else hk
-                self.indicator.show_guide(f"按住 {label} 说话")
+                self.indicator.show_guide("开始录音")
             elif kind == "recording":
                 # 按下热键：显示「正在录音」+ 红点呼吸
                 self.indicator.start_recording()
@@ -101,17 +123,24 @@ class App:
             elif kind == "refining":
                 self.indicator.show_refining()
             elif kind in ("done", "fallback"):
-                # 完成：直接隐藏 + 粘贴，pill 不显示预览文字
+                # 完成：直接隐藏 + 粘贴，pill 不显示预览文字；释放焦点锁定
+                self._target_hwnd = None
                 self.indicator.force_idle()
             elif kind == "error":
+                # 错误结束：释放焦点锁定
+                self._target_hwnd = None
                 self.indicator.show_error(evt[1] if len(evt) > 1 else "出错了")
             elif kind == "toast":
                 self.indicator.show_error(evt[1])
+            elif kind == "show_correction":
+                self._show_correction_dialog()
             elif kind == "model_loading":
                 pass  # 仅本地离线模式触发，不打扰
             elif kind in ("model_ready", "model_error"):
                 # 模型加载完成/失败都直接隐藏，不在 pill 里显示文字
                 self.indicator.force_idle()
+            elif kind == "type_partial":
+                self._do_type(evt[1])
             elif kind == "paste":
                 self._do_paste(evt[1], hide=(evt[2] if len(evt) > 2 else True))
             elif kind == "replace_paste":
@@ -139,8 +168,48 @@ class App:
         threading.Thread(target=job, daemon=True).start()
 
     # ================= 热键 =================
+    def _get_target_hwnd(self):
+        """录音开始时的目标输入控件：GetGUIThreadInfo.hwndFocus 优先，fallback 前台窗口。"""
+        try:
+            fg = _user32.GetForegroundWindow()
+            if not fg:
+                return None
+            tid = _user32.GetWindowThreadProcessId(fg, None)
+            from pill import _GUITHREADINFO
+            info = _GUITHREADINFO()
+            info.cbSize = ctypes.sizeof(info)
+            if _user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+                hwnd = info.hwndFocus or info.hwndCaret or fg
+            else:
+                hwnd = fg
+            return hwnd
+        except Exception:
+            return None
+
+    def _steal_focus(self, hwnd):
+        """把前台焦点抢回目标窗口：AttachThreadInput + Alt key trick 绕过前台锁定。"""
+        try:
+            fg = _user32.GetForegroundWindow()
+            if fg == hwnd:
+                return True
+            cur_tid = _kernel32.GetCurrentThreadId()
+            fg_tid = _user32.GetWindowThreadProcessId(fg, None)
+            if cur_tid != fg_tid:
+                _user32.AttachThreadInput(cur_tid, fg_tid, True)
+            _user32.keybd_event(0x12, 0, 0, 0)   # Alt down（绕过 SetForegroundWindow 前台限制）
+            _user32.SetForegroundWindow(hwnd)
+            _user32.keybd_event(0x12, 0, 2, 0)   # Alt up
+            if cur_tid != fg_tid:
+                _user32.AttachThreadInput(cur_tid, fg_tid, False)
+            return True
+        except Exception:
+            return False
+
     def _on_hold_start(self, _key):
         log.info("热键按下，开始录音")
+        # 焦点锁定（C1）：记录开始时的目标输入控件；录音/输入期间焦点被切走会抢回
+        self._target_hwnd = self._get_target_hwnd()
+        log.info("锁定目标窗口 hwnd=%s", self._target_hwnd)
         # 不再拦截"已有录音进行中"：允许前一句还在识别/润色时按下热键录下一句
         # （重叠录音）。hold 模式物理上同一键按住中不会再触发 WM_HOTKEY，
         # 所以这里每次按下都是独立的一次录音，配独立临时文件互不干扰。
@@ -171,6 +240,252 @@ class App:
         else:
             self._on_hold_end(_key)
 
+    def _on_correct_key(self, _key):
+        """纠错热键（Ctrl+反引号）触发：转主线程弹「错误纠正」框。"""
+        log.info("纠错热键触发")
+        self.ui_q.put(("show_correction", None))
+
+    def _pill_anchor(self):
+        """返回 pill 气泡当前屏幕矩形 (l, t, r, b)；拿不到返回 None。"""
+        try:
+            geom = self.indicator.win.geometry()  # "132x50+X+Y"
+            size, _, xy = geom.partition("+")
+            if not xy or "x" not in size:
+                return None
+            w_s, h_s = size.split("x")
+            x_s, y_s = xy.split("+")
+            x, y, w, h = int(x_s), int(y_s), int(w_s), int(h_s)
+            return x, y, x + w, y + h
+        except Exception:
+            return None
+
+    def _clipboard_backup(self):
+        """读当前剪贴板文本（用户原内容），失败返回 None。"""
+        try:
+            return self.root.clipboard_get()
+        except Exception:
+            return None
+
+    def _clipboard_restore(self, backup):
+        """把备份的原剪贴板内容写回去，避免污染用户剪贴板（方案A）。"""
+        if backup is None:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(backup)
+            self.root.update()
+        except Exception:
+            pass
+
+    def _send_ctrl_c(self):
+        """向当前焦点窗口发 Ctrl+C，把选中文本送入剪贴板。"""
+        try:
+            import pyautogui
+            pyautogui.hotkey("ctrl", "c")
+        except Exception as e:
+            log.warning("自动 Ctrl+C 失败: %s", e)
+
+    def _kb_on_press(self, key):
+        """pynput 钩子（后台线程）：Ctrl+反引号 → 纠错弹窗。防重复触发。
+
+        用 vk（虚拟键码 0xC0）判断反引号键：char 受键盘布局/输入法影响
+        （中文输入法下反引号键 char 可能是「·」而非「`」），vk 恒定可靠。
+        """
+        try:
+            kb = self._kb
+            if key in (kb.Key.ctrl_l, kb.Key.ctrl_r):
+                self._kb_ctrl = True
+                return
+            if self._kb_ctrl and not self._kb_correct_fired:
+                if getattr(key, "vk", None) == 0xC0:
+                    self._kb_correct_fired = True
+                    self._on_correct_key(None)
+        except Exception:
+            pass
+
+    def _kb_on_release(self, key):
+        try:
+            kb = self._kb
+            if key in (kb.Key.ctrl_l, kb.Key.ctrl_r):
+                self._kb_ctrl = False
+            elif getattr(key, "vk", None) == 0xC0:
+                self._kb_correct_fired = False
+        except Exception:
+            pass
+
+    # ================= 纠错弹窗（词库学习入口） =================
+    def _show_correction_dialog(self):
+        """「错误纠正」弹窗：macOS/Apple 浅色风格（稳定 pack 布局版）。
+
+        位置：贴 pill 气泡正上方 12px（水平居中于 pill）。B1 识别文本自动读
+        选中文字（方案A：备份剪贴板 → Ctrl+C → 读选中 → 恢复剪贴板），打开时
+        聚焦"正确写法"。
+        """
+        from gui import TEXT, TEXT_DIM, ACCENT, FONT, PillButton
+        from pill import TRANSPARENT, _round_rect_items
+
+        try:
+            from dictionary import add_entry
+        except Exception as e:
+            log.error("词库模块加载失败: %s", e)
+            self.ui_q.put(("error", "词库失败"))
+            return
+
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-toolwindow", True)
+        except Exception:
+            pass
+        win.configure(bg=TRANSPARENT)
+        win.attributes("-transparentcolor", TRANSPARENT)
+
+        W2 = 560                  # 弹窗宽度（放大版，给中文留余量）
+        PAD = 28                  # 内容区内边距
+        BODY_W = W2 - PAD * 2
+
+        wrong_var = tk.StringVar()
+        correct_var = tk.StringVar()
+        status_var = tk.StringVar()
+
+        # B1+方案A：自动复制选中（备份剪贴板 → Ctrl+C → 读选中 → 恢复剪贴板）
+        # 此时弹窗仍 withdraw、焦点在外部 app，Ctrl+C 才能取到选中文字
+        try:
+            _backup = self._clipboard_backup()
+            self._send_ctrl_c()
+            time.sleep(0.08)
+            _sel = self.root.clipboard_get()
+        except Exception:
+            _sel = ""
+        finally:
+            self._clipboard_restore(_backup)
+        if _sel and _sel.strip():
+            wrong_var.set(_sel.strip()[:120])
+
+        # 圆角白底：canvas 用 place 铺满窗口作背景画圆角白底，body 不透明白底内缩
+        # 8px 浮在上层。中间完全不透明遮住背后内容，外圈 8px 露出 canvas 圆角白底
+        # 形成圆角边框（对齐 pill.py 写法）。
+        canvas = tk.Canvas(win, bg=TRANSPARENT, highlightthickness=0, bd=0)
+        canvas.place(x=0, y=0, relwidth=1, relheight=1)
+
+        body = tk.Frame(win, bg="#FFFFFF")
+        # body 不透明白底、内缩 8px 浮在 canvas 圆角白底之上：
+        # 中间完全不透、遮住背后文字；外圈 8px 露出 canvas 圆角白底形成圆角边框。
+        body.place(x=8, y=8, width=W2 - 16, height=10)
+
+        # 窗口尺寸定好后画圆角白底（铺满，四角透明）
+        def _draw_bg():
+            w = win.winfo_width()
+            h = win.winfo_height()
+            if w <= 1 or h <= 1:
+                win.after(10, _draw_bg)
+                return
+            canvas.configure(width=w, height=h)
+            _round_rect_items(canvas, 0, 0, w, h, 18, "#FFFFFF")
+            # 把 canvas 降到 body 之下。tk.Canvas.lower 是 tag_lower 别名（必须带
+            # tagOrId），无参会 TclError；用 widget 级 lower 命令绕过别名。
+            canvas.tk.call('lower', canvas._w)
+
+        win.after(20, _draw_bg)
+
+        # ===== Header（兼作拖动把手：overrideredirect 无标题栏，需手动绑拖拽）=====
+        header = tk.Frame(body, bg="#FFFFFF", cursor="fleur")
+        header.pack(fill="x", padx=PAD, pady=(PAD, 0))
+
+        def _drag_start(e):
+            win._drag_x = e.x_root - win.winfo_x()
+            win._drag_y = e.y_root - win.winfo_y()
+
+        def _drag_move(e):
+            win.geometry(f"+{e.x_root - win._drag_x}+{e.y_root - win._drag_y}")
+
+        header.bind("<ButtonPress-1>", _drag_start)
+        header.bind("<B1-Motion>", _drag_move)
+
+        tk.Label(header, text="错误纠正", bg="#FFFFFF", fg=TEXT,
+                 font=FONT(24, "bold")).pack(anchor="w", pady=(0, 8))
+        tk.Label(header, text="发现识别结果有误？在这里修正并加入词库",
+                 bg="#FFFFFF", fg=TEXT_DIM, font=FONT(16)).pack(anchor="w", pady=(0, 22))
+
+        # ===== 识别文本 =====
+        tk.Label(body, text="识别文本", bg="#FFFFFF", fg="#333333",
+                 font=FONT(15, "bold")).pack(anchor="w", padx=PAD, pady=(0, 8))
+        wrong_lbl = tk.Label(body, textvariable=wrong_var, bg="#FAFAFC", fg=TEXT,
+                             font=FONT(17), wraplength=BODY_W - 32, justify="left",
+                             anchor="nw", padx=16, pady=16)
+        wrong_lbl.pack(fill="x", padx=PAD, pady=(0, 22))
+
+        # ===== 正确写法 =====
+        tk.Label(body, text="正确写法", bg="#FFFFFF", fg="#333333",
+                 font=FONT(15, "bold")).pack(anchor="w", padx=PAD, pady=(0, 8))
+        e2 = tk.Entry(body, textvariable=correct_var, bg="#FFFFFF", fg=TEXT,
+                      insertbackground=TEXT, relief="flat",
+                      font=FONT(17), highlightthickness=1,
+                      highlightbackground="#E0E0E0", highlightcolor=ACCENT, bd=0)
+        e2.pack(fill="x", padx=PAD, pady=(0, 28), ipady=16)
+
+        # ===== 状态 + 按钮 =====
+        def _confirm():
+            correct = correct_var.get().strip()
+            wrong = wrong_var.get().strip()
+            if not correct:
+                status_var.set("正确写法不能为空")
+                return
+            try:
+                entry = add_entry(correct, wrong, source="auto")
+                log.info("词库新增: correct=%r wrong=%r count=%s",
+                         correct, wrong, entry.get("count"))
+            except Exception as ex:
+                log.error("存入词库失败: %s", ex)
+                status_var.set("存入失败")
+                return
+            status_var.set(f"已存入词库：{correct}")
+            win.after(1200, win.destroy)
+
+        footer = tk.Frame(body, bg="#FFFFFF")
+        footer.pack(fill="x", padx=PAD, pady=(0, PAD))
+        status = tk.Label(footer, textvariable=status_var, bg="#FFFFFF", fg="#34C759",
+                          font=FONT(16))
+        status.pack(side="left")
+
+        # 占位 spacer 把按钮推到右侧；pack 顺序：先 right 的会后出现，因此先 pack 存入词库（最右），再 pack 取消（左侧）
+        tk.Frame(footer, bg="#FFFFFF").pack(side="left", fill="x", expand=True)
+        PillButton(footer, "存入词库", _confirm, primary=True, min_w=110).pack(side="right")
+        PillButton(footer, "取消", lambda: win.destroy(), primary=False,
+                   weight="normal", min_w=90).pack(side="right", padx=(0, 12))
+
+        # 位置计算必须在 body 渲染后
+        def _place():
+            win.update_idletasks()
+            H2 = body.winfo_reqheight() + 16   # 上下各 8px 内缩，给圆角白底边框
+            rect = self._pill_anchor()
+            if rect:
+                pl, pt, pr, pb = rect
+                pill_cx = (pl + pr) // 2
+                x = pill_cx - W2 // 2
+                y = pt - H2 - 12
+            else:
+                sw = win.winfo_screenwidth()
+                sh = win.winfo_screenheight()
+                x = (sw - W2) // 2
+                y = max(60, (sh - H2) // 3)
+            y = max(8, y)
+            win.geometry(f"{W2}x{H2}+{x}+{y}")
+            body.place_configure(width=W2 - 16, height=H2 - 16)
+            _draw_bg()
+
+        win.after(30, _place)
+
+        # 打开时聚焦正确写法
+        win.after(80, lambda: e2.focus_set())
+
+        e2.bind("<Return>", lambda _e: _confirm())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.deiconify()
+        win.lift()
+
     # ================= 录音→转写→润色→粘贴 =================
     def _record_job(self, stop):
         cfg = get_config()
@@ -192,7 +507,7 @@ class App:
             )
             if not ok or dur < 0.3:
                 log.warning("录音无效: ok=%s dur=%.2f err=%s", ok, dur, err)
-                self.ui_q.put(("error", "没听到声音，再试一次"))
+                self.ui_q.put(("error", "识别失败"))
                 return
             log.info("录音完成: %.2fs", dur)
 
@@ -226,21 +541,23 @@ class App:
         try:
             from recorder import record_chunks
             from sauc_asr import sauc_transcribe_stream
+            from dictionary import to_hotwords
         except Exception as e:
             log.error("导入 SAUC 流式模块失败: %s", e)
-            self.ui_q.put(("error", "SAUC 模块加载失败"))
+            self.ui_q.put(("error", "模块失败"))
             return
         round_id = self._round_seq
         self.ui_q.put(("transcribing", None))
         try:
             t_asr0 = time.time()
             text = sauc_transcribe_stream(
-                record_chunks(stop, on_level=self._on_level),
+                record_chunks(stop, on_level=self._on_level, max_seconds=90),
                 api_key=cfg.get("asr_sauc_key"),
                 resource_id=cfg.get("asr_sauc_resource_id"),
                 endpoint=cfg.get("asr_sauc_endpoint"),
                 language=cfg.get("language", "auto"),
                 proxy=cfg.get("proxy", ""),
+                hotwords=to_hotwords(),
             )
             log.info("SAUC 识别耗时=%.2fs", time.time() - t_asr0)
         except Exception as e:
@@ -258,8 +575,18 @@ class App:
         """
         log.info("识别结果: %s", text)
         if not text or not text.strip():
-            self.ui_q.put(("error", "没识别到内容"))
+            self.ui_q.put(("error", "没识别到"))
             return
+
+        # ASR（火山 SAUC）自带标点预测，纯数字/手机号/订单号常被补末尾句号
+        # （如「12345。」）。数字为主的文本先剥掉末尾标点再进润色/bypass 决策，
+        # 否则免润色直接贴原文会把句号一起贴出来；正常句子数字占比低不受影响。
+        from refiner import strip_numeric_trailing_punct
+        text = strip_numeric_trailing_punct(text)
+        # 词库本地替换（bypass 兜底）：错误变体命中即换成正确词（如「天气log」→changelog）。
+        # 只对免润色短句生效；LLM 路径有词典 + prompt 双重处理。
+        from dictionary import apply_local_replace
+        text = apply_local_replace(text)
 
         if self._refine_will_change(text):
             # 方案B：不先贴原文，显示「正在润色」并后台润色，完成后一次性贴最终文本。
@@ -283,24 +610,79 @@ class App:
             return False
         custom = cfg.get("custom_instructions", "") or ""
         if not custom:
-            # 与 refiner._should_bypass_llm 同阈值：≤8 有效字符跳过
-            from refiner import content_length
-            if content_length(text) <= 8:
+            # 与 refiner._should_bypass_llm 同阈值：≤15 有效字符跳过
+            from refiner import content_length, BYPASS_MAX_LENGTH
+            if content_length(text) <= BYPASS_MAX_LENGTH:
                 return False
         return True
 
     def _refine_and_paste(self, text, round_id):
-        """方案B：后台润色，完成后一次性粘贴最终文本（润色版或原文）。无 replace 步骤。"""
+        """后台润色并粘贴。
+
+        优先走流式（边润边贴，首字即上屏）；流式关闭或非 type 插入时回退整段 refine_text。
+        无 replace 步骤。
+        """
         # 若已有更新的录音轮次，旧润色作废，避免回插覆盖新内容。
         if round_id is not None and round_id != self._round_seq:
             log.info("润色轮次过期（已有新录音），跳过粘贴")
             self.ui_q.put(("done", text))
             return
+        cfg = get_config()
+        use_stream = cfg.get("refine_streaming", True) and (cfg.get("insert_method") or "type") == "type"
+        if use_stream:
+            self._refine_stream_and_paste(text, round_id)
+            return
+        # 整段路径（原方案B）
         t_rf0 = time.time()
         result = self._refine(text)
         log.info("润色耗时=%.2fs ok=%s reason=%s", time.time() - t_rf0, result["ok"], result.get("reason"))
         final = result["text"] if result["ok"] else text
+        # LLM 输出兜底：万一模型没遵守「数字不补句号」规则，同样剥掉。
+        from refiner import strip_numeric_trailing_punct
+        final = strip_numeric_trailing_punct(final)
         self.ui_q.put(("paste", final, True))
+
+    def _refine_stream_and_paste(self, text, round_id):
+        """流式润色：边收 delta 边逐段 SendInput，首字即上屏；首字前失败回退整段。"""
+        from refiner import refine_stream
+        from dictionary import to_llm_text
+        cfg = get_config()
+        t_rf0 = time.time()
+
+        def on_delta(seg):
+            # 过期则不再投递新分片（已贴部分保留，但不继续覆盖新内容）
+            if round_id is not None and round_id != self._round_seq:
+                return
+            self.ui_q.put(("type_partial", seg))
+
+        try:
+            result = refine_stream(
+                text=text,
+                api_key=cfg.get("api_key"),
+                api_base=cfg.get("api_base"),
+                model=cfg.get("api_model"),
+                custom_instructions=cfg.get("custom_instructions", ""),
+                user_dictionary=to_llm_text(),
+                language=cfg.get("language", "zh"),
+                proxy=cfg.get("proxy", ""),
+                on_delta=on_delta,
+            )
+        except Exception as e:
+            log.error("流式润色异常: %s", e)
+            result = {"ok": False, "text": text, "reason": "exception"}
+
+        log.info("流式润色耗时=%.2fs ok=%s reason=%s", time.time() - t_rf0, result["ok"], result.get("reason"))
+
+        if result["ok"]:
+            # 已通过 on_delta 逐段贴出（完整或部分），直接收尾。
+            self.ui_q.put(("done", text))
+        else:
+            # 首字前失败：回退整段润色（此时尚未贴任何字，安全）。
+            fallback = self._refine(text)
+            final = fallback["text"] if fallback["ok"] else text
+            from refiner import strip_numeric_trailing_punct
+            final = strip_numeric_trailing_punct(final)
+            self.ui_q.put(("paste", final, True))
 
     def _transcribe(self, wav_path, cfg):
         """按配置选择识别引擎：cloud=云端 ASR / local=本地 Whisper。"""
@@ -342,18 +724,32 @@ class App:
             return {"ok": False, "text": text, "reason": "no_api_key"}
         try:
             from refiner import refine_text
+            from dictionary import to_llm_text
             return refine_text(
                 text=text,
                 api_key=cfg.get("api_key"),
                 api_base=cfg.get("api_base"),
                 model=cfg.get("api_model"),
                 custom_instructions=cfg.get("custom_instructions", ""),
+                user_dictionary=to_llm_text(),
                 language=cfg.get("language", "zh"),
                 proxy=cfg.get("proxy", ""),
             )
         except Exception as e:
             log.error("润色调用异常: %s", e)
             return {"ok": False, "text": text, "reason": "exception"}
+
+    def _do_type(self, text):
+        """主线程：SendInput 逐字输入一段文本（流式分片），不隐藏 pill、不发 done。
+
+        用 char_interval 逐字投递，模拟人打字节奏——即使模型生成很快，文字也按固定节奏
+        逐字冒出，而不是整段瞬间蹦出（用户要的「像打字那样跳出来」）。
+        """
+        try:
+            from typer import type_text
+            type_text(text, char_interval=0.04)
+        except Exception as e:
+            log.warning("流式 SendInput 输入失败: %s", e)
 
     def _do_paste(self, text, hide=True, replace=False):
         """主线程：把 text 送进当前焦点窗口。
@@ -480,6 +876,19 @@ class App:
         ok = self.hotkey.start(self.cfg.get("hotkey"), self.cfg.get("trigger_mode", "hold"))
         if not ok:
             self.ui_q.put(("toast", "热键无效"))
+        # 纠错热键：Ctrl+反引号 —— 用 pynput 全局键盘钩子监听（不依赖 RegisterHotKey：
+        # v0.1.17 实测第二热键注册失败且真实错误码被掩盖，pynput 钩子稳定可控；
+        # 且实测无修饰反引号热键在带 Ctrl 时不会误触发录音，两键位共存安全）
+        try:
+            from pynput import keyboard as _kb
+            self._kb = _kb
+            self._kb_listener = _kb.Listener(
+                on_press=self._kb_on_press, on_release=self._kb_on_release)
+            self._kb_listener.daemon = True
+            self._kb_listener.start()
+            log.info("纠错热键监听已启动: Ctrl+`（pynput）")
+        except Exception as e:
+            log.warning("pynput 纠错热键监听启动失败: %s", e)
         # 启动托盘（后台线程）
         threading.Thread(target=self.tray.start, daemon=True).start()
         # 后台预热重依赖，避免首次按下热键才现场加载 numpy/sounddevice/websocket/pyautogui

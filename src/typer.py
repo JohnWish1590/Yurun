@@ -79,7 +79,7 @@ def _make_key_input(vk: int, up: bool) -> INPUT:
     return inp
 
 
-def type_text(text: str, chunk_pause: float = 0.0) -> int:
+def type_text(text: str, chunk_pause: float = 0.0, char_interval: float = 0.0) -> int:
     """把 text 逐字符 Unicode 输入到当前焦点窗口，不碰剪贴板。
 
     - 换行符 \\n / \\r 用 VK_RETURN 回车键发送（多数输入框才能正确换行）。
@@ -89,6 +89,19 @@ def type_text(text: str, chunk_pause: float = 0.0) -> int:
     """
     if not text:
         return 0
+    if char_interval > 0:
+        # 逐字发送，模拟人打字节奏（流式首字上屏用，避免整段瞬间蹦出）
+        total = 0
+        for ch in text:
+            if ch in ("\n", "\r"):
+                pair = [_make_key_input(VK_RETURN, False), _make_key_input(VK_RETURN, True)]
+            else:
+                pair = [_make_unicode_input(ord(ch), False), _make_unicode_input(ord(ch), True)]
+            arr = (INPUT * 2)(*pair)
+            sent = _user32.SendInput(2, ctypes.cast(arr, ctypes.POINTER(INPUT)), ctypes.sizeof(INPUT))
+            total += sent
+            time.sleep(char_interval)
+        return total
     inputs = []
     for ch in text:
         if ch in ("\n", "\r"):

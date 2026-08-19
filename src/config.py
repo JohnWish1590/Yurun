@@ -34,17 +34,19 @@ DEFAULTS = {
     "asr_model": "doubao-seed-asr-250429",  # 火山 doubao-seed-asr（可改）
     "asr_sauc_key": "",                  # 火山语音技术 App Key（SAUC 流式）
     "asr_sauc_resource_id": "volc.seedasr.sauc.duration",  # 2.0 小时版；1.0 用 volc.bigasr.sauc.duration
-    "asr_sauc_endpoint": "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream",
+    "asr_sauc_endpoint": "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
     "whisper_model": "small",          # 本地模型：base / small（推荐 small）
     "language": "auto",                # zh / en / auto
     # 热键
     "hotkey": "`",                     # 默认反引号
     "trigger_mode": "hold",            # hold=按住说话 / toggle=单击开关
+    "correction_hotkey": "`",          # 纠错热键（Ctrl+此键 弹「错误纠正」框）
     # 其他
     "auto_start": False,
     "proxy": "",                       # 留空=不走代理，如 http://127.0.0.1:7897
     "mirror": "https://hf-mirror.com",  # 模型下载镜像
     "insert_method": "type",           # type=SendInput逐字(零剪贴板污染,默认) / paste=剪贴板+Ctrl+V(兜底)
+    "refine_streaming": True,          # 流式首字上屏（边润边贴，默认开）；关闭则回退整段润色
 }
 
 class Config:

@@ -52,16 +52,25 @@
 > **涉及文件**：src/main.py、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md
 > **背景**：用户实测电脑睡眠唤醒后，语润设置窗口与「错误纠正」弹窗**所有字体突然整体放大**（字撑出格子），缩放设置未改、显示器未插拔，重启进程即恢复正常。根因：进程跨睡眠唤醒时，Windows（Win11 24H2）DWM 重新初始化触发 DPI 探测抖动，Tkinter 内部 `tk scaling` 被临时抬高，DPI 敏感的 `tkfont.Font` 随之放大；窗口几何/padding/canvas 圆角为固定像素未同步变，故文字「撑破格子」。非代码 bug，是进程跨睡眠未锁 DPI 所致。
 
-### 改动点
+### 改动点（初版，见下方二次修正）
 
 - **进程级 DPI 锁定**（`main.py` 顶部，任何窗口创建前）：`ctypes.windll.shcore.SetProcessDpiAwareness(1)`（SYSTEM_AWARE），声明后 Tk 不再跟随系统后续 DPI 漂移。
-- **font scaling 兜底锁定**（`App.__init__`，`tk.Tk()` 创建后）：`self.root.tk.call('tk', 'scaling', 1.0)`，锁死字体缩放因子，睡眠唤醒瞬间即便系统探测抖动也不放大。
+- **font scaling 兜底锁定（初版，已回退）**：`self.root.tk.call('tk', 'scaling', 1.0)`。
 - 版本号 1.0→**1.0.1**（`logger.py` `YURUN_VERSION` / `yurun_setup.iss` `MyAppVersion` 同步）。
+
+### 二次修正（同日）：改"硬钉 1.0"为"记住原值+漂移还原"
+
+> **背景**：初版硬钉 `tk scaling 1.0` 导致用户实测**所有界面字体整体变小**（pill 气泡/设置/纠错弹窗全是 tkfont.Font 驱动，无一幸免）。根因：`tk scaling` 是「点→像素」换算因子，用户系统 Tk 默认算出的值 >1.0（即 v1.0 正常字号基准），硬钉 1.0 把字压到约 75%。`SetProcessDpiAwareness(1)` 不改变像素、非元凶。
+
+- **删掉 `tk scaling 1.0` 硬钉**（字压小的直接原因）。
+- **保留 `SetProcessDpiAwareness(1)`**。
+- **新增 `_watch_dpi_drift`**（`App.__init__` 调用）：`tk.Tk()` 创建后捕获 `self._orig_scaling = float(root.tk.call('tk','scaling'))`（即 v1.0 原字号基准）；内部 `_restore` 每 2s（`root.after(2000)`）检查一次，若 `tk scaling` 偏离 `orig_scaling` 即还原；并绑 `<Configure>` 事件作即时兜底（WM_DPICHANGED 收不到时也能纠正）。漂移还原时记日志 `DPI 漂移已还原: x -> y`。
+- 效果：平时字号 = v1.0 原样；睡眠唤醒即使系统 DPI 抖动抬高 Tk 内部 scaling，2s 内被还原，不再整体放大。
 
 ### 验证
 
-- 代码层：`py_compile` 通过；`SetProcessDpiAwareness` 与 `tk scaling` 调用均 `try/except` 包裹，遇不支持环境静默跳过不崩。
-- 行为：进程跨睡眠唤醒后字体保持启动时的缩放，不再整体放大；多显示器间拖窗不会自动重适配（按「字别乱跑」诉求有意牺牲，可接受）。
+- 代码层：`py_compile` 通过；`SetProcessDpiAwareness`、`_orig_scaling` 捕获、`_restore` 均 `try/except` 包裹。
+- 行为：初版（字变小）已修正；字号恢复 v1.0；睡眠唤醒漂移由守卫还原。多显示器间拖窗不自动重适配（有意取舍）。
 
 ---
 

@@ -22,13 +22,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
 
-# DPI 锁死（防睡眠唤醒后系统 DPI 探测抖动导致 Tkinter 字体整体放大）：
-# 进程启动后声明 System DPI Aware，Tk 内部 font scaling 不再跟随系统后续漂移。
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)  # SYSTEM_AWARE
-except Exception:
-    pass
-
 from config import get_config
 from hotkey import get_hotkey
 from logger import (
@@ -220,8 +213,11 @@ class App:
             return False
 
     def _watch_dpi_drift(self):
-        """DPI 漂移守卫：睡眠唤醒/显示器变化可能让 Tk 内部 font scaling 跳变，
-        导致所有 tkfont.Font 整体放大或缩小。捕获启动原值，漂移即还原。"""
+        """DPI 漂移守卫：睡眠唤醒/显示器 DPI 变化会触发 Windows 广播 WM_DPICHANGED，
+        Tk 收到后会按"当前 DPI 感知模式"重算 font scaling，导致所有 tkfont.Font 整体
+        放大或缩小。这里捕获启动原值，并用 WndProc 子类化拦截 WM_DPICHANGED——
+        收到即把 scaling 还原回原值并吞掉该消息，阻止 Tk 在唤醒时重算字体，
+        保证睡眠前后字号完全一致。另加每 2s 周期兜底（其他路径改了 scaling 也能纠正）。"""
         if self._orig_scaling is None:
             return
 
@@ -233,22 +229,61 @@ class App:
                     log.info("DPI 漂移已还原: %.3f -> %.3f", cur, self._orig_scaling)
             except Exception:
                 pass
-            # 周期兜底：每 2s 检查一次（WM_DPICHANGED 收不到时也能纠正）
+            # 周期兜底：每 2s 检查一次
             try:
                 self.root.after(2000, _restore)
             except Exception:
                 pass
 
-        # 监听 Windows WM_DPICHANGED（睡眠唤醒/显示器 DPI 变化触发）
-        try:
-            self.root.bind('<Configure>', lambda e: _restore())
-        except Exception:
-            pass
-        # 启动首次调度
+        # 启动首次调度（周期兜底）
         try:
             self.root.after(2000, _restore)
         except Exception:
             pass
+
+        # === WndProc 子类化：拦截 WM_DPICHANGED (0x02E0) ===
+        # 收到该消息时先还原 scaling，再 return 0 告诉系统"已处理"，
+        # 阻止 Tk 默认重算字体（即睡眠唤醒后字号不再跳变）。
+        try:
+            import ctypes.wintypes as _wt
+
+            WM_DPICHANGED = 0x02E0
+            GWL_WNDPROC = -4
+
+            _user32 = ctypes.windll.user32
+            _SetWindowLongW = _user32.SetWindowLongW
+            _SetWindowLongW.restype = ctypes.c_void_p
+            _SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+            _CallWindowProcW = _user32.CallWindowProcW
+            _CallWindowProcW.restype = ctypes.c_int64
+            _CallWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int64, ctypes.c_int64]
+
+            _WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_int64, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int64, ctypes.c_int64)
+
+            hwnd = int(self.root.wm_frame(), 16)
+            self._orig_wndproc = None
+
+            def _new_wndproc(h, msg, wp, lp):
+                if msg == WM_DPICHANGED:
+                    # 先还原字体缩放，再吞掉消息，不让 Tk 重算
+                    try:
+                        self.root.tk.call('tk', 'scaling', self._orig_scaling)
+                        log.info("WM_DPICHANGED 拦截：scaling 已锁回 %.3f", self._orig_scaling)
+                    except Exception:
+                        pass
+                    return 0
+                # 其他消息转交 Tk 原 WndProc
+                if self._orig_wndproc:
+                    return _CallWindowProcW(self._orig_wndproc, h, msg, wp, lp)
+                return 0
+
+            _proc = _WNDPROC(_new_wndproc)
+            self._wndproc_ref = _proc  # 保活，避免被 GC
+            old = _SetWindowLongW(hwnd, GWL_WNDPROC, _proc)
+            self._orig_wndproc = old
+            log.info("WM_DPICHANGED 拦截已安装 (hwnd=%s)", hwnd)
+        except Exception as _e:
+            log.warning("WM_DPICHANGED 拦截安装失败，仅用周期兜底: %s", _e)
 
     def _on_hold_start(self, _key):
         log.info("热键按下，开始录音")

@@ -74,11 +74,13 @@ class App:
 
         self.root = tk.Tk()
         self.root.withdraw()
-        # 锁死 font scaling，避免跨睡眠唤醒时 Tk 内部 scaling 被抬高导致字体放大。
+        # DPI 缩放锁：捕获启动时的系统 font scaling（即 v1.0 原字号基准），
+        # 睡眠唤醒/显示器变化导致 Tk 内部 scaling 漂移时还原回原值，字体不再整体放大或缩小。
         try:
-            self.root.tk.call('tk', 'scaling', 1.0)
+            self._orig_scaling = float(self.root.tk.call('tk', 'scaling'))
         except Exception:
-            pass
+            self._orig_scaling = None
+        self._watch_dpi_drift()
         # Tk 回调异常也写进日志（崩溃可反馈）
         register_tk_error(self.root)
         self.indicator = PillBubble(self.root)
@@ -216,6 +218,37 @@ class App:
             return True
         except Exception:
             return False
+
+    def _watch_dpi_drift(self):
+        """DPI 漂移守卫：睡眠唤醒/显示器变化可能让 Tk 内部 font scaling 跳变，
+        导致所有 tkfont.Font 整体放大或缩小。捕获启动原值，漂移即还原。"""
+        if self._orig_scaling is None:
+            return
+
+        def _restore():
+            try:
+                cur = float(self.root.tk.call('tk', 'scaling'))
+                if abs(cur - self._orig_scaling) > 1e-3:
+                    self.root.tk.call('tk', 'scaling', self._orig_scaling)
+                    log.info("DPI 漂移已还原: %.3f -> %.3f", cur, self._orig_scaling)
+            except Exception:
+                pass
+            # 周期兜底：每 2s 检查一次（WM_DPICHANGED 收不到时也能纠正）
+            try:
+                self.root.after(2000, _restore)
+            except Exception:
+                pass
+
+        # 监听 Windows WM_DPICHANGED（睡眠唤醒/显示器 DPI 变化触发）
+        try:
+            self.root.bind('<Configure>', lambda e: _restore())
+        except Exception:
+            pass
+        # 启动首次调度
+        try:
+            self.root.after(2000, _restore)
+        except Exception:
+            pass
 
     def _on_hold_start(self, _key):
         log.info("热键按下，开始录音")

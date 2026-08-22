@@ -22,6 +22,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
 
+# DPI 锁死（防睡眠唤醒后系统 DPI 探测抖动导致 Tkinter 字体整体放大）：
+# 进程启动后声明 System DPI Aware，Tk 内部 font scaling 不再跟随系统后续漂移。
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)  # SYSTEM_AWARE
+except Exception:
+    pass
+
 from config import get_config
 from hotkey import get_hotkey
 from logger import (
@@ -67,6 +74,11 @@ class App:
 
         self.root = tk.Tk()
         self.root.withdraw()
+        # 锁死 font scaling，避免跨睡眠唤醒时 Tk 内部 scaling 被抬高导致字体放大。
+        try:
+            self.root.tk.call('tk', 'scaling', 1.0)
+        except Exception:
+            pass
         # Tk 回调异常也写进日志（崩溃可反馈）
         register_tk_error(self.root)
         self.indicator = PillBubble(self.root)

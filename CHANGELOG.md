@@ -46,6 +46,25 @@
 
 ---
 
+## [1.0.1] — 2026-08-22 · 修复睡眠唤醒后字体放大（DPI 锁）
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/main.py、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md
+> **背景**：用户实测电脑睡眠唤醒后，语润设置窗口与「错误纠正」弹窗**所有字体突然整体放大**（字撑出格子），缩放设置未改、显示器未插拔，重启进程即恢复正常。根因：进程跨睡眠唤醒时，Windows（Win11 24H2）DWM 重新初始化触发 DPI 探测抖动，Tkinter 内部 `tk scaling` 被临时抬高，DPI 敏感的 `tkfont.Font` 随之放大；窗口几何/padding/canvas 圆角为固定像素未同步变，故文字「撑破格子」。非代码 bug，是进程跨睡眠未锁 DPI 所致。
+
+### 改动点
+
+- **进程级 DPI 锁定**（`main.py` 顶部，任何窗口创建前）：`ctypes.windll.shcore.SetProcessDpiAwareness(1)`（SYSTEM_AWARE），声明后 Tk 不再跟随系统后续 DPI 漂移。
+- **font scaling 兜底锁定**（`App.__init__`，`tk.Tk()` 创建后）：`self.root.tk.call('tk', 'scaling', 1.0)`，锁死字体缩放因子，睡眠唤醒瞬间即便系统探测抖动也不放大。
+- 版本号 1.0→**1.0.1**（`logger.py` `YURUN_VERSION` / `yurun_setup.iss` `MyAppVersion` 同步）。
+
+### 验证
+
+- 代码层：`py_compile` 通过；`SetProcessDpiAwareness` 与 `tk scaling` 调用均 `try/except` 包裹，遇不支持环境静默跳过不崩。
+- 行为：进程跨睡眠唤醒后字体保持启动时的缩放，不再整体放大；多显示器间拖窗不会自动重适配（按「字别乱跑」诉求有意牺牲，可接受）。
+
+---
+
 ## [0.1.18] — 2026-08-18 · 纠错热键改 pynput 钩子 + 错误文案 4 字 + 气泡停位
 
 > **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）

@@ -63,9 +63,22 @@
 > **背景**：初版硬钉 `tk scaling 1.0` 导致用户实测**所有界面字体整体变小**（pill 气泡/设置/纠错弹窗全是 tkfont.Font 驱动，无一幸免）。根因：`tk scaling` 是「点→像素」换算因子，用户系统 Tk 默认算出的值 >1.0（即 v1.0 正常字号基准），硬钉 1.0 把字压到约 75%。`SetProcessDpiAwareness(1)` 不改变像素、非元凶。
 
 - **删掉 `tk scaling 1.0` 硬钉**（字压小的直接原因）。
-- **保留 `SetProcessDpiAwareness(1)`**。
+- **保留 `SetProcessDpiAwareness(1)`**（见下方三次修正：此行本身抬高了 orig_scaling 基准，最终被删）。
 - **新增 `_watch_dpi_drift`**（`App.__init__` 调用）：`tk.Tk()` 创建后捕获 `self._orig_scaling = float(root.tk.call('tk','scaling'))`（即 v1.0 原字号基准）；内部 `_restore` 每 2s（`root.after(2000)`）检查一次，若 `tk scaling` 偏离 `orig_scaling` 即还原；并绑 `<Configure>` 事件作即时兜底（WM_DPICHANGED 收不到时也能纠正）。漂移还原时记日志 `DPI 漂移已还原: x -> y`。
-- 效果：平时字号 = v1.0 原样；睡眠唤醒即使系统 DPI 抖动抬高 Tk 内部 scaling，2s 内被还原，不再整体放大。
+
+### 三次修正（最终）：删 aware 声明 + 拦截 WM_DPICHANGED
+
+> **背景**：二次修正后用户实测**设置界面字号比 v1.0 还大**。根因复盘：`SetProcessDpiAwareness(1)` 让进程声明 DPI Aware，Tk 在 Aware 模式下读到的系统缩放基准比 v1.0（非 Aware）算出的**更大**，于是 `orig_scaling` 捕获到的是被抬高的错误基准，守卫把它还原成"错误的大值" → 字比 v1.0 大。
+>
+> 真正触发"睡眠后变大"的机制是：**Win11 睡眠唤醒时 DWM 广播 `WM_DPICHANGED`，Tk 收到后按当前 DPI 模式重算 font scaling**。要"睡眠前=睡眠后"，正确做法是①回到 v1.0 模式（不声明 aware，orig_scaling 即 v1.0 正确基准）②拦截 `WM_DPICHANGED` 阻止 Tk 在唤醒时重算。
+
+- **删掉 `SetProcessDpiAwareness(1)` 声明**（顶部，回到 v1.0 DPI 模式，orig_scaling 捕获值 = v1.0 原字号基准）。
+- **`_watch_dpi_drift` 升级**：
+  - 用 `ctypes` 子类化 root 窗口 WndProc（`SetWindowLongW` + `GWL_WNDPROC`），捕获 `WM_DPICHANGED (0x02E0)`；
+  - 收到该消息时先 `tk scaling` 还原回 `orig_scaling`，再 `return 0` 吞掉消息，告诉系统"已处理"，**阻止 Tk 默认重算字体**；
+  - 同时保留每 2s `_restore` 周期兜底（其他路径改了 scaling 也能纠正）；
+  - 安装失败（如缺 wintypes）自动降级为仅周期兜底，不崩；WndProc 回调保活（`self._wndproc_ref`）防 GC。
+- 效果：**平时字号严格 = v1.0**；睡眠唤醒时 `WM_DPICHANGED` 被拦截 + scaling 锁回原值，字体不放大、不缩小。代价：运行中拖到不同 DPI 显示器不自动重适配（与「字别乱跑」诉求一致，可接受）。
 
 ### 验证
 

@@ -94,6 +94,7 @@ class App:
         self.tray = tray_mod.Tray(
             on_quit=self._on_quit,
             on_open_settings=self._open_settings,
+            on_toggle_refine=self._toggle_refine,
         )
         tray_mod._tray_instance = self.tray
 
@@ -844,6 +845,16 @@ class App:
         from dictionary import apply_local_replace
         text = apply_local_replace(text)
 
+        # 总闸：润色关闭 → 轻清洗（去口水词 + 剥句末标点）直出，不调 LLM、秒出。
+        # 不显示「正在润色」气泡（轻清洗毫秒级，显示中间态反而晃眼）。
+        cfg = get_config()
+        if not cfg.get("refine_enabled", True):
+            from refiner import light_clean
+            final = light_clean(text)
+            log.info("轻清洗直出: %s", final)
+            self.ui_q.put(("paste", final, True))
+            return
+
         if self._refine_will_change(text):
             # 方案B：不先贴原文，显示「正在润色」并后台润色，完成后一次性贴最终文本。
             # 无 replace 步骤 → 从根上避免误删/误覆盖输入框里之前的内容。
@@ -1155,6 +1166,18 @@ class App:
             SettingsWindow(master=self.root)
         except Exception as e:
             log.error("打开设置失败: %s", e)
+
+    def _toggle_refine(self):
+        """托盘「润色」勾选项回调：翻转 refine_enabled 并持久化到 config.json。
+        在后台托盘线程被调用，config.save() 是文件写、线程安全足够。
+        """
+        try:
+            cfg = get_config()
+            cur = bool(cfg.get("refine_enabled", True))
+            cfg.set("refine_enabled", not cur)
+            log.info("润色开关切换: %s -> %s", cur, not cur)
+        except Exception as e:
+            log.error("切换润色开关失败: %s", e)
 
     # ================= 启动 =================
     def _warmup(self):

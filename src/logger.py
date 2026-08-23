@@ -15,7 +15,7 @@ import traceback
 from pathlib import Path
 
 APP_NAME = "Yurun"
-YURUN_VERSION = "1.1.1"
+YURUN_VERSION = "1.2.1"
 
 # 全局 Tk root 引用（由 main 在创建后注册），用于捕获 Tk 回调异常
 _tk_root = None
@@ -53,12 +53,15 @@ def get_logger(name: str = "yurun") -> logging.Logger:
             logger.addHandler(handler)
         except Exception:
             pass
-        try:
-            console = logging.StreamHandler()
-            console.setFormatter(fmt)
-            logger.addHandler(console)
-        except Exception:
-            pass
+        # 仅在存在有效 stdout/stderr 时挂控制台 handler（PyInstaller --noconsole 下
+        # sys.stdout/stderr 为 None，强制写入会触发 AttributeError 并吞掉后续日志）。
+        if sys.stdout is not None:
+            try:
+                console = logging.StreamHandler()
+                console.setFormatter(fmt)
+                logger.addHandler(console)
+            except Exception:
+                pass
     logger.propagate = False
     _logger = logger
     return logger

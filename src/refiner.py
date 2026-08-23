@@ -352,3 +352,57 @@ def refine_stream(
     if not refined:
         return {"ok": False, "text": source, "reason": "empty_output"}
     return {"ok": True, "text": refined, "reason": "ok"}
+
+
+# ===================== 轻清洗（润色关模式，纯本地规则、秒出） =====================
+# 设计取舍（与用户对齐，方案 X）：
+# - 只删「几乎无实义的低风险语气词」：呃/嗯/哦/额/唉（口语叹息/停顿，删了不伤语义）。
+# - 不删任何双字/多字填充词（这个/那个/就是/其实/然后/的话/对吧/反正/就是说 等），
+#   因为它们常作实义（「这个方案不错」「然后我们走」），一刀切会误伤。
+# - 不删「吧/哎/呀/啊」（保留「算了吧」「哎呀」「你好呀」「我的天啊」等）。
+# - 不做重复词合并（避免误伤「让我想想」→「让我想」）。
+# - 末尾标点规则：短句（≤5 字）或纯数字串剥「句末标点」（连续末尾全剥）；
+#   正常长句（>5 字且非纯数字）保留末尾标点。句末标点不含逗号/顿号/波浪号。
+
+_LIGHT_SINGLE_FILLERS = ["呃", "嗯", "哦", "额", "唉"]
+_LIGHT_TRAILING_PUNCT = "。．.！!？?；;：:"
+# 仅含数字（可含小数点与空格）视为「纯数字串」，如 12345 / 3.14；带单位（如「128元」）不算。
+_RE_PURE_DIGITS = re.compile(r"^[0-9][0-9\s.]*$")
+
+# 预编译：单字语气词（后接任意标点/空白也一并吃掉，避免留下空格）
+_RE_SINGLE = re.compile("[" + re.escape("".join(_LIGHT_SINGLE_FILLERS)) + "][\\s,。.!?;:，、~～…]*")
+
+
+def _is_short_or_numeric(t: str) -> bool:
+    """短句（≤5 字符）或纯数字串 → 需要剥句末标点；正常长句保留标点。"""
+    if not t:
+        return False
+    core = t.rstrip(_LIGHT_TRAILING_PUNCT).rstrip()
+    if _RE_PURE_DIGITS.match(core):       # 剥掉末尾标点后是纯数字（可含小数点/空格）
+        return True
+    if len(t) <= 5:                       # 短句
+        return True
+    return False
+
+
+def light_clean(text: str) -> str:
+    """轻清洗：去口语 filler + 按规则剥句末标点，纯正则、毫秒级、不调 LLM。
+
+    用于「润色关」模式：用户要的是「去口水字 + 秒出」，而非 LLM 大改写。
+    返回清洗后的文本；若输入为空原样返回。
+
+    末尾标点规则（用户明确）：
+    - 短句（≤5 字）或纯数字串 → 剥「句末标点」（连续末尾全剥）；
+    - 正常长句（>5 字且非纯数字）→ 末尾标点保留。
+    """
+    t = str(text or "").strip()
+    if not t:
+        return t
+    # 1) 删单字语气词（连同紧跟的标点/空白）
+    t = _RE_SINGLE.sub("", t)
+    # 2) 合并被拆出的多余空白（filler 删除可能留下空格）
+    t = re.sub(r"\\s+", " ", t).strip()
+    # 4) 末尾标点规则：短句/纯数字剥「句末标点」（连续末尾全剥）；正常长句保留。
+    if _is_short_or_numeric(t):
+        t = t.rstrip(_LIGHT_TRAILING_PUNCT).rstrip()
+    return t

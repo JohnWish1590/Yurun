@@ -32,10 +32,11 @@ ASSETS_ICON = _resolve_icon()
 
 
 class Tray:
-    def __init__(self, on_quit=None, on_open_settings=None):
+    def __init__(self, on_quit=None, on_open_settings=None, on_toggle_refine=None):
         self._icon = None
         self._on_quit = on_quit
         self._on_open_settings = on_open_settings
+        self._on_toggle_refine = on_toggle_refine
         self._lock = threading.Lock()
 
     @staticmethod
@@ -60,6 +61,11 @@ class Tray:
         menu = pystray.Menu(
             pystray.MenuItem("打开设置", lambda: self._safe(self._on_open_settings)),
             pystray.MenuItem("打开日志目录", lambda: self._safe(self._open_logs)),
+            pystray.MenuItem(
+                "润色",
+                lambda item: self._safe(lambda: self._toggle_refine()),
+                checked=lambda item: self._refine_checked(),
+            ),
             pystray.MenuItem("退出", lambda: self._safe(self._on_quit)),
         )
         # pystray 的 icon 参数必须是 PIL Image；传字符串路径会在 setup 线程
@@ -83,6 +89,28 @@ class Tray:
         try:
             if fn:
                 fn()
+        except Exception:
+            pass
+
+    def _refine_checked(self):
+        """菜单勾选状态：润色开启时打勾。"""
+        try:
+            from config import get_config
+            return bool(get_config().get("refine_enabled", True))
+        except Exception:
+            return True
+
+    def _toggle_refine(self):
+        """翻转润色开关并持久化；由 main 注入的回调负责改 config + save。"""
+        try:
+            if self._on_toggle_refine:
+                self._on_toggle_refine()
+        except Exception:
+            pass
+        # 刷新菜单勾选状态（pystray 在下次打开菜单时也会重读，但主动更新更即时）
+        try:
+            if self._icon is not None:
+                self._icon.update_menu()
         except Exception:
             pass
 

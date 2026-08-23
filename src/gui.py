@@ -231,22 +231,17 @@ class SettingsWindow:
     def _init_vars(self):
         c = self.cfg
         v = self._var
-        v["asr_mode"] = tk.StringVar(
-            value="cloud" if c.get("asr_provider") in ("cloud", "sauc", "") else "local")
         v["sauc_key"] = tk.StringVar(value=c.get("asr_sauc_key") or "")
         v["sauc_resource"] = tk.StringVar(
             value=c.get("asr_sauc_resource_id") or "volc.seedasr.sauc.duration")
         v["sauc_endpoint"] = tk.StringVar(
             value=c.get("asr_sauc_endpoint") or
             "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream")
-        v["local_model"] = tk.StringVar(value=c.get("whisper_model") or "small")
-        v["local_lang"] = tk.StringVar(value=c.get("language") or "auto")
         v["refine_key"] = tk.StringVar(value=c.get("api_key") or "")
         v["refine_base"] = tk.StringVar(value=c.get("api_base") or "https://ark.cn-beijing.volces.com/api/v3")
         v["refine_model"] = tk.StringVar(value=c.get("api_model") or "")
         v["hotkey"] = tk.StringVar(value=c.get("hotkey") or "`")
         v["trigger"] = tk.StringVar(value=c.get("trigger_mode") or "hold")
-        v["insert"] = tk.StringVar(value=c.get("insert_method") or "type")
 
     # ================= 构建 =================
     def _build(self):
@@ -258,7 +253,7 @@ class SettingsWindow:
         # Header
         tk.Label(self.body, text="语润", bg=BG, fg=TEXT,
                  font=FONT(F_APP_TITLE, "bold")).pack(anchor="w")
-        tk.Label(self.body, text="按住快捷键说话。松开即润色输出",
+        tk.Label(self.body, text="按下即听，松手即现",
                  bg=BG, fg=TEXT_DIM, font=FONT(F_SUBTITLE)).pack(anchor="w", pady=(8, 24))
 
         # 卡片一：语音引擎
@@ -358,16 +353,8 @@ class SettingsWindow:
     # ---------- 识别 ----------
     def _build_asr(self, card):
         v = self._var
-        seg = Segmented(card, [("cloud", "云端火山"), ("local", "本地离线")],
-                        self._on_asr_mode, v["asr_mode"].get())
-        self._card_header(card, "语音引擎", right=seg)
-        self._seg_asr = seg
-
-        self._cloud_box = tk.Frame(card, bg=CARD)
-        self._local_box = tk.Frame(card, bg=CARD)
-        self._build_cloud(self._cloud_box)
-        self._build_local(self._local_box)
-        self._apply_asr_mode(v["asr_mode"].get())
+        self._card_header(card, "语音引擎")
+        self._build_cloud(card)
 
     def _build_cloud(self, parent):
         v = self._var
@@ -385,33 +372,12 @@ class SettingsWindow:
         self._field(self._adv_box, "资源ID", v["sauc_resource"])
         self._adv_box.pack_forget()
 
-    def _build_local(self, parent):
-        v = self._var
-        row = tk.Frame(parent, bg=CARD)
-        row.pack(fill="x", pady=(0, FIELD_GAP))
-        tk.Label(row, text="模型", bg=CARD, fg=TEXT, font=FONT(F_ROW)).pack(side="left")
-        seg = Segmented(row, [("small", "small 推荐"), ("base", "base 快")],
-                        self._on_local_model, v["local_model"].get())
-        seg.pack(side="right")
-        self._seg_model = seg
-
-        row2 = tk.Frame(parent, bg=CARD)
-        row2.pack(fill="x", pady=(0, FIELD_GAP))
-        tk.Label(row2, text="语言", bg=CARD, fg=TEXT, font=FONT(F_ROW)).pack(side="left")
-        seg2 = Segmented(row2, [("auto", "自动"), ("zh", "中文"), ("en", "英语")],
-                         self._on_local_lang, v["local_lang"].get())
-        seg2.pack(side="right")
-        self._seg_lang = seg2
-
-        tk.Label(parent, text="首次使用会自动下载模型（small 约 460MB / base 约 140MB）",
-                 bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC)).pack(anchor="w", pady=(8, 0))
-
     # ---------- 润色 ----------
     def _build_refine(self, card):
         v = self._var
-        self._card_header(card, "润色 API")
+        self._card_header(card, "润色 API（可选）")
         self._field(card, "API Key", v["refine_key"], show="*")
-        tk.Label(card, text="润色 API Key（OpenAI 兼容，sk-/ark- 等均可）",
+        tk.Label(card, text="润色 API Key（可选，OpenAI 兼容，sk-/ark- 等均可）。不填则仅支持轻清洗，托盘「润色」不可用。",
                  bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC)).pack(anchor="w", pady=(8, 0))
 
         self._refine_adv_btn = tk.Label(card, text="高级（Base URL / 模型 已预填）", bg=CARD,
@@ -448,17 +414,6 @@ class SettingsWindow:
         seg.pack(side="right")
         self._seg_trigger = seg
 
-        row3 = tk.Frame(card, bg=CARD)
-        row3.pack(fill="x", pady=(0, FIELD_GAP))
-        tk.Label(row3, text="粘贴方式", bg=CARD, fg=TEXT, font=FONT(F_ROW)).pack(side="left")
-        seg2 = Segmented(row3, [("type", "逐字输入"), ("paste", "剪贴板")],
-                         self._on_insert, v["insert"].get())
-        seg2.pack(side="right")
-        self._seg_insert = seg2
-
-        tk.Label(card, text="逐字输入不污染剪贴板历史（默认）；个别窗口不兼容时切「剪贴板」",
-                 bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC)).pack(anchor="w", pady=(8, 0))
-
     # ================= 控件 =================
     def _entry(self, parent, var, width=None, show=None):
         e = tk.Entry(parent, textvariable=var, font=FONT(F_INPUT),
@@ -479,30 +434,8 @@ class SettingsWindow:
         return e
 
     # ================= 交互 =================
-    def _on_asr_mode(self, value):
-        self._var["asr_mode"].set(value)
-        self._apply_asr_mode(value)
-        self._refit()
-
-    def _apply_asr_mode(self, mode):
-        if mode == "cloud":
-            self._cloud_box.pack(fill="x")
-            self._local_box.pack_forget()
-        else:
-            self._cloud_box.pack_forget()
-            self._local_box.pack(fill="x")
-
-    def _on_local_model(self, value):
-        self._var["local_model"].set(value)
-
-    def _on_local_lang(self, value):
-        self._var["local_lang"].set(value)
-
     def _on_trigger(self, value):
         self._var["trigger"].set(value)
-
-    def _on_insert(self, value):
-        self._var["insert"].set(value)
 
     def _toggle_adv(self):
         self._adv_visible = not self._adv_visible
@@ -524,19 +457,23 @@ class SettingsWindow:
     def _save(self):
         c = self.cfg
         v = self._var
-        mode = v["asr_mode"].get()
-        c.set("asr_provider", "sauc" if mode == "cloud" else "local")
-        c.set("asr_sauc_key", v["sauc_key"].get().strip())
+        sauc_key = v["sauc_key"].get().strip()
+        if not sauc_key:
+            messagebox.showwarning("语润", "请先填写语音识别 API Key", parent=self.root)
+            return
+        c.set("asr_provider", "sauc")
+        c.set("asr_sauc_key", sauc_key)
         c.set("asr_sauc_resource_id", v["sauc_resource"].get().strip())
         c.set("asr_sauc_endpoint", v["sauc_endpoint"].get().strip())
-        c.set("whisper_model", v["local_model"].get())
-        c.set("language", v["local_lang"].get().strip() or "auto")
-        c.set("api_key", v["refine_key"].get().strip())
+        refine_key = v["refine_key"].get().strip()
+        c.set("api_key", refine_key)
         c.set("api_base", v["refine_base"].get().strip())
         c.set("api_model", v["refine_model"].get().strip())
+        # 润色 Key 未填 → 强制关闭润色（无 key 无法润色）
+        if not refine_key:
+            c.set("refine_enabled", False)
         c.set("hotkey", v["hotkey"].get().strip() or "`")
         c.set("trigger_mode", v["trigger"].get())
-        c.set("insert_method", v["insert"].get())
         messagebox.showinfo("语润", "设置已保存", parent=self.root)
         self.root.destroy()
 

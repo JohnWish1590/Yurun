@@ -65,6 +65,7 @@ class Tray:
                 "润色",
                 lambda item: self._safe(lambda: self._toggle_refine()),
                 checked=lambda item: self._refine_checked(),
+                enabled=lambda item: self._refine_enabled(),
             ),
             pystray.MenuItem("退出", lambda: self._safe(self._on_quit)),
         )
@@ -99,6 +100,14 @@ class Tray:
             return bool(get_config().get("refine_enabled", True))
         except Exception:
             return True
+
+    def _refine_enabled(self):
+        """菜单项可用性：未配置润色 API Key 时置灰不可用。"""
+        try:
+            from config import get_config
+            return bool(get_config().get("api_key"))
+        except Exception:
+            return False
 
     def _toggle_refine(self):
         """翻转润色开关并持久化；由 main 注入的回调负责改 config + save。"""

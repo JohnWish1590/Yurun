@@ -4,6 +4,36 @@
 
 ---
 
+## [1.0.2] — 2026-08-23 · SAUC 真流式实测（T0-T7 时间戳 + Partial 测试浮窗）
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/sauc_asr.py、src/main.py、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md、docs/ASR-识别引擎架构说明.md、docs/架构诊断与重构方案.md
+> **背景**：基于「架构诊断与重构方案」结论——语润默认 SAUC 已是**真流式** ASR，最大浪费是 Partial Result 从未进入用户体验。为量化「SAUC 到底慢不慢」「Partial 是否实时可用」，做 Phase 0（测量）与 Phase 1（释放 Partial 验证），**不动输入主路径（SendInput/TSF 均未触碰）**。配套两份 `docs/` 文档：一份给朋友看「语润目前在用识别模型」（ASR-识别引擎架构说明），一份正式架构诊断（架构诊断与重构方案）。
+
+### 改动点
+
+- **Phase 0 — T0-T7 时间戳**（`src/sauc_asr.py` `sauc_transcribe_stream`）：
+  - 新增 `on_timeline(mark, t)` 回调；函数内埋 T0（建连前）/T1（连接建立）/T2（首包 PCM）/T3（首个 Partial）/T4（最后包 PCM）/T5（发 FLAG_LAST）/T6（Final 结果）/T7（关闭）八个打点。
+  - `main.py` `_record_job_sauc` 收集时间戳，`_log_timeline()` 在识别结束后打印**相对 T0 的毫秒分解** + 三个派生指标：**首字延迟(T0→T3)**、**松手→Final(T5→T6)**、**纯收尾(T4→T6)**。可直接看清「识别耗时」里多少是录音时长、多少是服务器处理。
+- **Phase 1 — Partial 测试浮窗**（`src/main.py`）：
+  - `sauc_transcribe_stream` 新增 `on_partial(text)` 回调；`_record_job_sauc` 把每次 Partial 经 `ui_q` 投 `(partial_preview, text)`。
+  - 新增独立 `Toplevel` 浮窗（`_ensure_partial_window`/`_show_partial`/`_hide_partial`）：录音期间**实时显示 SAUC 中间结果**，置顶 + `overrideredirect`（不抢焦点）、**不 SendInput、不碰 TSF**。录音结束（done/error/新一轮 recording）自动隐藏。
+  - 目的：验证「说一句、文字跟着出来」是否稳定，为后续 Phase 2（伪 Preedit）/Phase 3（TSF Bridge）积累证据。
+
+### 验证
+
+- 代码层：`py_compile` 通过（`src/sauc_asr.py`/`src/main.py`）。
+- 行为：输入主路径（短句 bypass / 长句流式润色 / SendInput 逐字）**完全不变**；仅新增调试浮窗 + 日志时间戳。需真机实测确认 Partial 浮窗稳定跟随、T0-T7 分解符合预期（预计首字 100~300ms、松手→Final <1s）。
+- 待 Phase 0/1 实测通过后，再进入 Phase 2（SendInput 增量伪 Preedit）与 Phase 3（TSF Bridge）。
+
+### 行为变化
+
+- 版本号 1.0.1→**1.0.2**（`logger.py` `YURUN_VERSION` / `yurun_setup.iss` `MyAppVersion` 同步）。
+- 录音期间屏幕左上角（默认 +40,+40）出现半透明**绿色 Partial 浮窗**，实时跟读；松手识别完成后自动消失。
+- 日志新增 `SAUC 时间戳(相对T0, ms)` 与 `SAUC 派生` 两行（详见 `docs/架构诊断与重构方案.md` §4 Phase 0）。
+
+---
+
 ## [1.0] — 2026-08-19 · 重大版本（端到端管线定型 + 纠错弹窗最终修复）
 
 > **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）

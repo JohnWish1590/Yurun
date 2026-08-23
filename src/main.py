@@ -64,6 +64,9 @@ class App:
         # 焦点锁定（C1）：录音开始时锁定目标输入控件，切走自动抢回
         self._target_hwnd = None
         self._last_steal = 0.0
+        # Phase 1 验证浮窗：独立 Toplevel，实时显示 SAUC Partial（不抢焦点/不 SendInput/不碰 TSF）。
+        self._partial_win = None
+        self._partial_lbl = None
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -123,6 +126,7 @@ class App:
             elif kind == "recording":
                 # 按下热键：显示「正在录音」+ 红点呼吸
                 self.indicator.start_recording()
+                self._hide_partial()          # 新一轮录音：清掉上一次的 Partial 浮窗
             elif kind == "transcribing":
                 # 松手后、ASR 等待期间：显示「正在识别」（苹果蓝麦克风），
                 # 不再误显「正在录音」，避免"框凭空跳出来"的错觉。
@@ -132,10 +136,12 @@ class App:
             elif kind in ("done", "fallback"):
                 # 完成：直接隐藏 + 粘贴，pill 不显示预览文字；释放焦点锁定
                 self._target_hwnd = None
+                self._hide_partial()
                 self.indicator.force_idle()
             elif kind == "error":
                 # 错误结束：释放焦点锁定
                 self._target_hwnd = None
+                self._hide_partial()
                 self.indicator.show_error(evt[1] if len(evt) > 1 else "出错了")
             elif kind == "toast":
                 self.indicator.show_error(evt[1])
@@ -148,6 +154,9 @@ class App:
                 self.indicator.force_idle()
             elif kind == "type_partial":
                 self._do_type(evt[1])
+            elif kind == "partial_preview":
+                # Phase 1：SAUC 实时中间结果，仅打测试浮窗，不进输入主路径
+                self._show_partial(evt[1])
             elif kind == "paste":
                 self._do_paste(evt[1], hide=(evt[2] if len(evt) > 2 else True))
             elif kind == "replace_paste":
@@ -629,7 +638,9 @@ class App:
         round_id = self._round_seq
         self.ui_q.put(("transcribing", None))
         try:
-            t_asr0 = time.time()
+            # Phase 1：Partial 经 UI 队列打到测试浮窗（不碰 SendInput 主路径）。
+            # Phase 0：on_timeline 收集 T0-T7 时间戳，待识别结束打印耗时分解。
+            self._timeline = {}
             text = sauc_transcribe_stream(
                 record_chunks(stop, on_level=self._on_level, max_seconds=90),
                 api_key=cfg.get("asr_sauc_key"),
@@ -638,13 +649,74 @@ class App:
                 language=cfg.get("language", "auto"),
                 proxy=cfg.get("proxy", ""),
                 hotwords=to_hotwords(),
+                on_partial=lambda t: self.ui_q.put(("partial_preview", t)),
+                on_timeline=lambda m, t: self._timeline.__setitem__(m, t),
             )
-            log.info("SAUC 识别耗时=%.2fs", time.time() - t_asr0)
+            self._log_timeline()
         except Exception as e:
             log.error("识别失败: %s", e)
             self.ui_q.put(("error", "识别失败"))
             return
         self._after_transcribe(text, round_id=round_id)
+
+    def _log_timeline(self):
+        """Phase 0：打印 SAUC 识别 T0-T7 时间戳分解（相对 T0 的毫秒）。"""
+        m = getattr(self, "_timeline", None) or {}
+        if "T0" not in m:
+            return
+        t0 = m["T0"]
+        def rel(k):
+            return (m[k] - t0) * 1000.0 if k in m else float("nan")
+        def span(a, b):
+            return (m[b] - m[a]) * 1000.0 if (a in m and b in m) else float("nan")
+        log.info(
+            "SAUC 时间戳(相对T0, ms): T1=%.0f T2=%.0f T3=%.0f T4=%.0f T5=%.0f T6=%.0f T7=%.0f",
+            rel("T1"), rel("T2"), rel("T3"), rel("T4"), rel("T5"), rel("T6"), rel("T7"),
+        )
+        log.info(
+            "SAUC 派生: 首字延迟(T0→T3)=%.0fms 松手→Final(T5→T6)=%.0fms 纯收尾(T4→T6)=%.0fms",
+            span("T0", "T3"), span("T5", "T6"), span("T4", "T6"),
+        )
+
+    # ---- Phase 1：SAUC Partial 测试浮窗（验证用，不改输入主路径） ----
+    def _ensure_partial_window(self):
+        if self._partial_win is not None:
+            return
+        try:
+            w = tk.Toplevel(self.root)
+            w.overrideredirect(True)          # 无标题栏，避免抢焦点
+            w.attributes("-topmost", True)    # 置顶但不抢输入焦点
+            w.attributes("-alpha", 0.92)
+            w.configure(bg="#1e1e2e")
+            lbl = tk.Label(
+                w, text="", bg="#1e1e2e", fg="#a6e3a1",
+                font=("Microsoft YaHei UI", 13),
+                padx=12, pady=8, wraplength=560, justify="left", anchor="w",
+            )
+            lbl.pack()
+            w.geometry("+%d+%d" % (40, 40))
+            w.withdraw()
+            self._partial_win = w
+            self._partial_lbl = lbl
+        except Exception as e:
+            log.warning("Partial 测试浮窗创建失败: %s", e)
+
+    def _show_partial(self, text):
+        self._ensure_partial_window()
+        if self._partial_win is None:
+            return
+        try:
+            self._partial_lbl.configure(text="▌ " + (text or ""))
+            self._partial_win.deiconify()
+        except Exception:
+            pass
+
+    def _hide_partial(self):
+        if self._partial_win is not None:
+            try:
+                self._partial_win.withdraw()
+            except Exception:
+                pass
 
     def _after_transcribe(self, text, round_id=None):
         """识别成功后的共用收尾。

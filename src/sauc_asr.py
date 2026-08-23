@@ -224,7 +224,7 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
                            resource_id: str = "volc.bigasr.sauc.duration",
                            endpoint: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
                            language: str = "auto", proxy: str = "", timeout: int = 90,
-                           hotwords=None) -> str:
+                           hotwords=None, on_partial=None, on_timeline=None) -> str:
     """双向流式识别（bigmodel 端点）：边录边发，边收中间结果。
 
     chunk_iter: 迭代产生 int16 PCM bytes（如 recorder.record_chunks）。
@@ -233,9 +233,22 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
 
     用 WebSocketApp 回调模式：on_message 在 run_forever 线程，send 从录音线程
     调用，天然规避同步 WebSocket「跨线程 send/recv」竞争（之前导致 indicator 卡死的坑）。
+
+    诊断回调（Phase 0/1，不影响主路径）：
+    - on_partial(text): 每次收到服务端中间结果/最终结果时回调（主线程请自行投到 UI 队列）。
+    - on_timeline(mark, t): 打点 T0..T7 时间戳（见 docs/架构诊断与重构方案.md §4 Phase 0）。
     """
     if not api_key:
         raise ValueError("SAUC 识别未配置 API Key")
+
+    def _t(mark):
+        if on_timeline:
+            try:
+                on_timeline(mark, time.time())
+            except Exception:
+                pass
+
+    _t("T0")  # 建连前
 
     request_id = str(uuid.uuid4())
     connect_id = str(uuid.uuid4())
@@ -251,11 +264,13 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
         "error": None,
         "opened": threading.Event(),
         "done": threading.Event(),
+        "first_partial": False,
     }
 
     def _on_open(ws):
         ws.send(_build_full_request(language, hotwords), opcode=0x2)  # BINARY 帧
         state["opened"].set()
+        _t("T1")  # 连接建立
 
     def _on_message(ws, message):
         if isinstance(message, str):
@@ -272,8 +287,17 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
             return
         if parsed.get("text"):
             state["text"] = parsed["text"]
+            if not state["first_partial"]:
+                state["first_partial"] = True
+                _t("T3")  # 首个 Partial
+            if on_partial:
+                try:
+                    on_partial(state["text"])
+                except Exception:
+                    pass
         flags = (message[1] & 0x0F) if len(message) > 1 else 0
         if flags & 0b0010:  # FLAG_LAST 最终结果
+            _t("T6")  # Final 结果
             state["done"].set()
 
     def _on_error(ws, error):
@@ -305,9 +329,15 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
 
     try:
         # 边录边发：录音线程持续发音频块，on_message 线程持续收中间结果（防缓冲区积压）
+        first_chunk = True
         for chunk in chunk_iter:
+            if first_chunk:
+                _t("T2")  # 第一包 PCM
+                first_chunk = False
             ws.send(_build_audio_packet(chunk, is_last=False), opcode=0x2)
+        _t("T4")  # 最后包 PCM（松手）
         ws.send(_build_audio_packet(b"", is_last=True), opcode=0x2)
+        _t("T5")  # 发 FLAG_LAST
         # 松手后等最终结果（FLAG_LAST）：完整不漏字。bigmodel 端点边听边识别，
         # 松手后最终结果已经很快（真实场景约 0.6~1s），无需冒险用中间结果
         # （中间结果缺最后一段音频的识别，会漏掉松手前最后 1 秒的话）。
@@ -318,6 +348,7 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
             ws.close(timeout=0.2)
         except Exception:
             pass
+    _t("T7")  # 关闭
 
     if state["error"]:
         raise RuntimeError(f"SAUC 错误: {state['error']}")

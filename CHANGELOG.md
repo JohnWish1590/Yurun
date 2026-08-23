@@ -4,6 +4,44 @@
 
 ---
 
+## [1.1.1] — 2026-08-23 · Partial 浮窗打磨（钉左缘不晃 + 逐字吸走动画定速 30ms）
+
+> **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）
+> **涉及文件**：src/main.py、src/pill.py、src/logger.py、installer/yurun_setup.iss、CHANGELOG.md
+> **背景**：v1.0.2 引入的 SAUC Partial 测试浮窗在真机实测中存在三类体验问题——①录音阶段浮窗整体居中、文字变长时左右同时外胀，视觉「晃」；②润色后浮窗「逐字被吸进文本框」的动画要么一下全没、要么一闪而逝；③删字节奏与打字节奏耦合，无法独立调。本轮在「先分析不动手、对齐后再改」的原则下，逐项定位根因并修复，最终用户实测 30ms/字 为满意节奏。
+
+### 改动点
+
+- **① 浮窗钉左缘（根除录音阶段「左右晃」）**（`src/main.py` `_show_partial`）：
+  - 旧逻辑：`x = px + (pill_w - pw) // 2`（以 indicator 气泡中心为锚点**居中**），文字一变长 → 窗口宽度 `pw` 变 → 中心点不变 → **左右两边同时往外胀**，盯框的人觉得晃；到第二行 `wraplength` 撑满后宽度封顶才不晃。
+  - 新逻辑：浮窗**左缘固定**钉在 indicator 左缘下方（`x = px + 固定偏移`，不随 `pw` 重算）；窗口宽度跟随文字自然增长 → **只往右/往下长，左缘不动**。超右屏时一次性左移（基于最大宽估算，不随字数跳）。y 维持现状（底部钉在气泡上方、顶部随行数往上长，不算晃）。
+
+- **② 修复「吸走动画一下没 / 一闪而逝」**（`src/main.py` `_hide_partial` + 删字机制重构）：
+  - 根因：上一轮把删字从「绑定打字步」改为**独立慢速定时器**（`_drain_timer_step`，`_draining` 标志驱动），但 `_finish_partial_drain` 用 `finally: self._partial_finishing = False` 把保护标志瞬间复位；打字一结束 `done` 事件触发 `_hide_partial`，只检查 `_partial_finishing`（已被复位成 False）→ **保护失效，直接 `withdraw()` 瞬间隐藏浮窗**，删字定时器在不可见窗口上跑完 → 表现「0.1 秒一闪而逝」（日志实证：浮窗 101 字、间隔 80ms，理论应 8 秒，实测不到 1 秒）。
+  - 修复：`_hide_partial` 的保护改为同时检查 `self._draining`（删字定时器在跑时**绝不 withdraw**）；定时器删到空才自行 withdraw。
+  - 同步删掉旧同步写法遗留的 `_drain_one_char`（已被定时器版取代），`_type_step` 不再绑打字步删字。
+
+- **③ 删字节奏独立可调 + 定速 30ms**（`src/main.py` `__init__` `_drain_interval`）：
+  - 删字节奏与打字节奏（SendInput 40ms/字）彻底解耦，由独立参数 `_drain_interval` 控制。
+  - 真机逐档实测：80ms（太慢）→ 50ms → 34ms → **30ms（用户确认最满意）**，故固化为 30ms/字。此时删字（30ms×N）略快于打字（40ms×N），浮窗「伴随文字稍晚清空」，逐字可见、绝不一次消失。
+
+### 验证
+
+- 代码层：`py_compile src/main.py` 通过；grep 确认无 `_drain_one_char`/`_partial_finish_step` 残留引用。
+- 单元测试（`test_drain*.py`，逻辑层）：复刻删字定时器，确认是**逐字删**（删完剩余=0、循环按字数执行），无「一次清空」隐藏路径。
+- 节奏实测（`test_drain*.py` 真实 sleep 版）：101 字 × 80ms = 实测 8.20s（理论 8.08s）；打字 101 字 × 40ms = 4.04s。证明修复后浮窗删字明显慢于打字、会逐字可见。
+- 集成测试（`test_hide.py`，真实 tk）：模拟 `_draining=True` 时 `hide_partial()` 被拦截不 withdraw；`_draining=False` 时正常 withdraw——修复生效。
+- 真机：用户实测录音阶段浮窗只往右长不晃、润色后浮窗慢慢逐字消失，30ms 节奏满意。
+
+### 行为变化
+
+- 版本号 1.0.2→**1.1.1**（`logger.py` `YURUN_VERSION` / `yurun_setup.iss` `MyAppVersion` 同步）。
+- 录音阶段 Partial 浮窗：左缘固定、只往右/往下生长，不再左右晃动。
+- 润色后浮窗「逐字被吸进文本框」动画：稳定逐字消失（30ms/字），不再一下全没或一闪而逝。
+- 日志新增调试行：`流式打字链收到片段 len=`、`浮窗慢速删字启动: 当前长度=`（便于后续核查浮窗实际长度与删字节奏）。
+
+---
+
 ## [1.0.2] — 2026-08-23 · SAUC 真流式实测（T0-T7 时间戳 + Partial 测试浮窗）
 
 > **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）

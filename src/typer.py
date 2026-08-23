@@ -79,12 +79,13 @@ def _make_key_input(vk: int, up: bool) -> INPUT:
     return inp
 
 
-def type_text(text: str, chunk_pause: float = 0.0, char_interval: float = 0.0) -> int:
+def type_text(text: str, chunk_pause: float = 0.0, char_interval: float = 0.0, on_each=None) -> int:
     """把 text 逐字符 Unicode 输入到当前焦点窗口，不碰剪贴板。
 
     - 换行符 \\n / \\r 用 VK_RETURN 回车键发送（多数输入框才能正确换行）。
     - 其余字符用 KEYEVENTF_UNICODE 发 Unicode 码点。
     - chunk_pause：每批之间的停顿（秒），0 = 一次性发完。
+    - on_each：每成功投递一个字后回调（用于浮窗"逐字吸走"动画与打字严格同步）。
     返回 SendInput 实际投递的事件数。
     """
     if not text:
@@ -100,6 +101,11 @@ def type_text(text: str, chunk_pause: float = 0.0, char_interval: float = 0.0) -
             arr = (INPUT * 2)(*pair)
             sent = _user32.SendInput(2, ctypes.cast(arr, ctypes.POINTER(INPUT)), ctypes.sizeof(INPUT))
             total += sent
+            if on_each:
+                try:
+                    on_each(ch)
+                except Exception:
+                    pass
             time.sleep(char_interval)
         return total
     inputs = []

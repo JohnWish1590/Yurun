@@ -419,6 +419,14 @@ class PillBubble:
         pass
 
     # ============ 内部 ============
+    def get_rect(self):
+        """返回气泡窗口当前屏幕坐标 (x, y, w, h)。未初始化/失败返回 None。"""
+        try:
+            return (self.win.winfo_x(), self.win.winfo_y(),
+                    self.win.winfo_width(), self.win.winfo_height())
+        except Exception:
+            return None
+
     def _reposition(self):
         """将气泡定位到当前光标正下方（带 OFFSET_X 偏移），每次进入活动态时调用。"""
         x, y = _compute_anchor()

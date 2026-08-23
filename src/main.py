@@ -67,6 +67,16 @@ class App:
         # Phase 1 验证浮窗：独立 Toplevel，实时显示 SAUC Partial（不抢焦点/不 SendInput/不碰 TSF）。
         self._partial_win = None
         self._partial_lbl = None
+        # 浮窗"逐字被吸进文本框"动画状态：删字用独立的慢速定时器驱动（与打字解耦），
+        # 让吸走明显慢于打字，避免"一下全没"；打字结束后若有剩字也由它慢慢收尾。
+        self._partial_finishing = False
+        self._partial_finish_id = None
+        self._draining = False
+        self._drain_interval = 30  # 删字节奏：每 30ms 删 1 字（打字 40ms/字，用户实测最满意的伴随节奏）
+        # 异步打字：缓冲区 + 单链 after 驱动（不阻塞 tk 主循环，浮窗动画才可见重绘）
+        self._type_buf = ""
+        self._typing = False
+        self._type_on_done = None
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -690,7 +700,7 @@ class App:
             w.configure(bg="#1e1e2e")
             lbl = tk.Label(
                 w, text="", bg="#1e1e2e", fg="#a6e3a1",
-                font=("Microsoft YaHei UI", 13),
+                font=("Microsoft YaHei UI", 15),
                 padx=12, pady=8, wraplength=560, justify="left", anchor="w",
             )
             lbl.pack()
@@ -703,20 +713,114 @@ class App:
 
     def _show_partial(self, text):
         self._ensure_partial_window()
+        # 新一轮录音/新结果：取消进行中的"逐字吸走"收尾动画，避免串台
+        if self._partial_finish_id:
+            try:
+                self.root.after_cancel(self._partial_finish_id)
+            except Exception:
+                pass
+            self._partial_finish_id = None
+            self._partial_finishing = False
         if self._partial_win is None:
             return
         try:
             self._partial_lbl.configure(text="▌ " + (text or ""))
             self._partial_win.deiconify()
+            self._partial_win.update_idletasks()  # 让 geometry 尺寸先算出来再定位
+            pw = self._partial_win.winfo_width()
+            ph = self._partial_win.winfo_height()
+            scr_w = _user32.GetSystemMetrics(0)
+
+            # 方案2修正：优先贴在语润自己的 indicator（正在录音/润色气泡）正上方。
+            # 定位改为「钉左缘」：浮窗左缘固定对齐 indicator 左缘，文字只往右/往下长，
+            # 不再随字数变化而左右两边同时扩大 —— 根除录音阶段浮窗「向两边胀」的跳动感。
+            p = self.indicator.get_rect() if self.indicator else None
+            if p:
+                px, py, pill_w, pill_h = p
+                LEFT_OFFSET = 0
+                max_w = 560 + 24  # wraplength(560) + 左右 padding(12*2)，用于超右屏的一次性钳制
+                x = px + LEFT_OFFSET
+                if x + max_w > scr_w - 4:
+                    x = scr_w - max_w - 4  # 超右屏则整体左移（一次性，不随字数跳）
+                x = max(4, x)
+                y = py - ph - 8
+                if y < 4:
+                    y = py + pill_h + 8  # indicator 贴屏顶时改放其正下方
+                self._partial_win.geometry("+%d+%d" % (x, y))
+                return
+
+            # fallback：贴在当前输入窗口头顶正中
+            hwnd = self._target_hwnd or _user32.GetForegroundWindow()
+            if hwnd:
+                import ctypes.wintypes as _wt
+                rect = _wt.RECT()
+                if _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    win_w = rect.right - rect.left
+                    x = rect.left + max(0, (win_w - pw) // 2)
+                    x = max(4, min(x, scr_w - pw - 4))
+                    y = rect.top - ph - 12
+                    if y < 4:
+                        y = rect.top + 24
+                    self._partial_win.geometry("+%d+%d" % (x, y))
         except Exception:
             pass
 
     def _hide_partial(self):
+        # 浮窗收尾动画（慢速删字定时器）进行中：让它自然播完（字被逐个吸进文本框），不强制隐藏。
+        # 必须同时检查 _draining —— 否则 done 事件的 withdraw 会在打字一结束就把浮窗瞬间隐藏，
+        # 慢速删字定时器在"已隐藏"的不可见窗口上跑完，表现为"一闪而逝"。
+        if self._partial_finishing or self._draining:
+            return
         if self._partial_win is not None:
             try:
                 self._partial_win.withdraw()
             except Exception:
                 pass
+
+    def _start_drain(self):
+        """启动（或续跑）独立的慢速删字定时器：与打字解耦，明显慢于打字，
+        让浮窗逐字「吸走」的动画清晰可见，而不是跟打字同速一下退完。"""
+        if self._draining:
+            return
+        if self._partial_win is None:
+            return
+        cur = self._partial_lbl.cget("text") or ""
+        if not cur:
+            self._partial_win.withdraw()
+            return
+        try:
+            log.debug("浮窗慢速删字启动: 当前长度=%d 间隔=%dms", len(cur), self._drain_interval)
+        except Exception:
+            pass
+        self._draining = True
+        self.root.after(self._drain_interval, self._drain_timer_step)
+
+    def _drain_timer_step(self):
+        try:
+            if self._partial_win is None:
+                self._draining = False
+                return
+            cur = self._partial_lbl.cget("text") or ""
+            if not cur:
+                self._draining = False
+                self._partial_win.withdraw()
+                return
+            self._partial_lbl.configure(text=cur[1:])
+            self._partial_win.update_idletasks()
+            self.root.after(self._drain_interval, self._drain_timer_step)
+        except Exception:
+            self._draining = False
+
+    def _finish_partial_drain(self):
+        """打字/粘贴结束后，若浮窗还有剩字，转入慢速删字定时器慢慢收尾，
+        避免"字先打完、浮窗还挂着"（用户要求浮窗不晚于文字结束）。"""
+        if self._partial_finishing:
+            return
+        self._partial_finishing = True
+        try:
+            self._start_drain()
+        finally:
+            self._partial_finishing = False
 
     def _after_transcribe(self, text, round_id=None):
         """识别成功后的共用收尾。
@@ -896,12 +1000,62 @@ class App:
 
         用 char_interval 逐字投递，模拟人打字节奏——即使模型生成很快，文字也按固定节奏
         逐字冒出，而不是整段瞬间蹦出（用户要的「像打字那样跳出来」）。
+        on_each 把"浮窗从开头删一字"绑进打字循环，使吸走动画与打字严格同步（开头对齐）。
         """
         try:
             from typer import type_text
-            type_text(text, char_interval=0.04)
+            # ③ 切窗口兜底：每段打字前把焦点抢回录音时锁定的原窗口。
+            # pump 的焦点锁在 _do_type 同步阻塞期间不运行，必须在投字前主动抢回，
+            # 否则用户在润色阶段切走，SendInput 会把字投进新窗口。
+            if self._target_hwnd and _user32.GetForegroundWindow() != self._target_hwnd:
+                self._steal_focus(self._target_hwnd)
+            # 异步打字链由 tk 主循环驱动：逐字打字的同时，独立的慢速删字定时器
+            # （_start_drain → _drain_timer_step）从浮窗开头逐字吸走，明显慢于打字。
+            # 这里绝不能再 withdraw 浮窗，否则第一段 chunk enqueue 完就 withdraw，浮窗会"一下全没"。
+            try:
+                log.debug("流式打字链收到片段: len=%d", len(text) if text else 0)
+            except Exception:
+                pass
+            self._enqueue_type(text)
         except Exception as e:
             log.warning("流式 SendInput 输入失败: %s", e)
+
+    def _enqueue_type(self, text, on_done=None):
+        """把文本追加到打字缓冲区并启动异步打字链（单链，避免多段并发错序）。"""
+        # ③ 切窗口兜底：打字前把焦点抢回录音时锁定的原窗口
+        if self._target_hwnd and _user32.GetForegroundWindow() != self._target_hwnd:
+            self._steal_focus(self._target_hwnd)
+        self._type_buf += text
+        if on_done is not None:
+            self._type_on_done = on_done
+        if not self._typing:
+            self._typing = True
+            self.root.after(0, self._type_step)
+            # 打字一开始即启动慢速删字（开头对齐打字），与打字解耦、明显慢于打字
+            self._start_drain()
+
+    def _type_step(self):
+        if not self._type_buf:
+            self._typing = False
+            cb = self._type_on_done
+            self._type_on_done = None
+            self._finish_partial_drain()
+            if cb:
+                try:
+                    cb()
+                except Exception:
+                    pass
+            return
+        ch = self._type_buf[0]
+        self._type_buf = self._type_buf[1:]
+        try:
+            from typer import type_text
+            type_text(ch)
+        except Exception as e:
+            log.warning("逐字 SendInput 失败: %s", e)
+        # 删字不再绑定打字步（那样会和打字同速，显得"一下没"）；
+        # 改由独立的慢速定时器（_drain_timer_step）驱动，明显慢于打字，逐字吸走可见。
+        self.root.after(40, self._type_step)
 
     def _do_paste(self, text, hide=True, replace=False):
         """主线程：把 text 送进当前焦点窗口。
@@ -921,18 +1075,22 @@ class App:
             # 主路径：SendInput 逐字 Unicode 输入，不碰剪贴板
             try:
                 from typer import type_text
-                # 短暂停顿让目标窗口焦点稳定
-                time.sleep(0.02)
-                sent = type_text(text)
-                log.info("SendInput 已投递 %d 字（type 模式，零剪贴板污染）", sent)
-                if hide:
-                    self.ui_q.put(("done", text))
+                # 走统一的异步打字链（_enqueue_type 已含抢焦点），由 tk 主循环驱动，
+                # 保证浮窗逐字吸走动画可见；done 由 on_done 在打字完成后发出
+                log.info("SendInput（type 模式，异步，零剪贴板污染）")
+                self._enqueue_type(
+                    text,
+                    on_done=(lambda: self.ui_q.put(("done", text))) if hide else None,
+                )
                 return
             except Exception as e:
                 log.warning("SendInput 输入失败: %s，回退剪贴板粘贴", e)
                 # 落到下面的 paste 路径作兜底
 
         # paste 路径（兜底或用户显式选择）：写剪贴板 + Ctrl+V
+        # ③ 切窗口兜底：粘贴前抢回焦点，字进原窗口
+        if self._target_hwnd and _user32.GetForegroundWindow() != self._target_hwnd:
+            self._steal_focus(self._target_hwnd)
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
@@ -951,6 +1109,8 @@ class App:
             else:
                 pyautogui.hotkey("ctrl", "v")
                 log.info("Ctrl+V 已发送")
+            # 浮窗收尾（若有剩字），再发 done（done 不会打断收尾）
+            pass  # 收尾交给异步打字链（_enqueue_type → _type_step → _finish_partial_drain）
             if hide:
                 self.ui_q.put(("done", text))
         except Exception as e:

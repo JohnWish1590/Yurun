@@ -12,6 +12,13 @@
 
 当前版本见 `src/logger.py` 的 `YURUN_VERSION` 与 `installer/yurun_setup.iss` 的 `MyAppVersion`，**两者必须保持一致**。
 
+## 当前发布：v1.3.0（2026-08-29）
+
+- 发布内容：Yurun 2.0 / Phase 0——默认「快速输入」、可选「智能整理」、托盘互斥模式选择、自适应逐字输入动画及本地插入体验埋点。
+- 发布边界：`Pre/` 中的焦点策略实验未合入、未打包、未发布。
+- 发布资产：`dist/语润.exe` 为本机正式包；GitHub 附件使用 ASCII 文件名 `Yurun-v1.3.0.exe`，避免平台错误解析中文文件名。
+- 回退点：`stable-before-phase0-promotion-20260829` 标签及 `backups/stable-before-phase0-promotion-20260829.zip`。
+
 ## 发布流程（手动）
 
 1. 在 `src/logger.py` 与 `installer/yurun_setup.iss` 同步更新版本号。

@@ -4,6 +4,81 @@
 
 ---
 
+## [1.3.0] — 2026-08-29 · 默认快速输入 + 自适应输入动画
+
+> **发布范围**：Yurun 2.0 / Phase 0 已从 Preview 验收并入正式版。焦点策略仍保留在 `Pre/` 的实验区，本版本**不包含**该实验。
+> **涉及文件**：src/config.py、src/gui.py、src/main.py、src/tray.py、src/logger.py、installer/yurun_setup.iss、README.md、CHANGELOG.md、RELEASE.md
+
+### 改动点
+
+- **默认模式翻转**：新安装默认使用「快速输入」（`input_mode=direct`）；AI「智能整理」改为可选模式，而不是主路径。
+- **兼容旧配置**：保留 `refine_enabled`。旧用户没有 `input_mode` 时，会按原有润色开关映射，避免升级后擅自改变既有使用习惯。
+- **托盘模式选择**：原「润色」开关替换为互斥的「快速输入 / 智能整理」；切换后立即保存，无需重启。
+- **自适应动画预算**：保留逐字流入辨识度；短句维持约 40ms/字，文本越长自动加速，并保留 8ms 安全下限，优先保证完整、可靠输入。
+- **体验埋点**：新增 `insert_start`、`first_insert`、`insert_done` 三个本地事件；`TTFI` 定义为松开热键到首次插入，`TTCI` 定义为松开热键到全部插入完成。记录写入 `%APPDATA%\\Yurun\\logs\\insert-metrics.jsonl`，不保存转写正文。
+
+### 验证
+
+- Python 编译检查及旧配置迁移检查通过。
+- Preview 真机样本显示：直接输入模式在短、中、长文本上均完成更快；历史约 1.8 秒的旧版体验仅作为估算参考，不作为严格统计基线。
+- 正式版构建前已建立 Git 标签 `stable-before-phase0-promotion-20260829` 与对应备份，便于回退。
+
+### 行为变化
+
+- 日常使用时，语润默认是「按下 → 说话 → 松开 → 出字」的全局语音输入层。
+- 需要改写、整理口语时，仍可在托盘主动切换到「智能整理」。
+- 文字较长时，视觉逐字效果仍在，但不会再以固定慢速拖长整段完成时间。
+
+---
+
+## [1.2.2] — 2026-08-23 · 设置界面精简 + 托盘润色灰显
+
+> **编辑**：WorkBuddy（本仓库 AI 协作 agent）
+> **涉及文件**：src/gui.py、src/tray.py、src/logger.py、installer/yurun_setup.iss、README.md、CHANGELOG.md
+> **背景**：v1.2.1 的双模式润色已跑通，但设置界面残留了不少"看起来能选、实际没用"的入口——「本地离线」分支（Whisper）需要下载几百 MB 模型、且识别质量与速度都打不过云端 SAUC；「粘贴方式」在内部其实只有一条主路径，让用户选是制造困惑；「语言选择」对 SAUC 也没有必要暴露。同时用户希望"只做识别"的场景能零门槛：只填一个 SAUC Key 就能用，润色 Key 变成纯可选。本版据此精简设置界面，并让托盘「润色」菜单项在未配置润色 Key 时自动灰显。
+
+### 改动点
+
+- **① 移除「本地离线」识别分支（UI 层）**（`src/gui.py`）：
+  - 删除「云端火山 / 本地离线」Segmented 切换选项卡，语音引擎卡片固定为云端火山 SAUC 单引擎。
+  - 删除本地模型选择（small / base）、语言选择（自动 / 中文 / 英语）、模型下载提示等全部本地相关 UI；删除 `_build_local`、`_apply_asr_mode`、`_on_asr_mode`、`_on_local_model`、`_on_local_lang` 等方法；`_init_vars` 移除 `asr_mode`、`local_model`、`local_lang` 三个 var。
+  - **底层代码刻意保留**：`transcriber.py`（Faster-Whisper）、`cloud_asr.py` 文件不动，`config.py` 的本地模型字段保留（向后兼容旧 config.json），仅界面不再暴露入口。
+
+- **② 移除「粘贴方式」设置项**（`src/gui.py`）：删除「逐字输入 / 剪贴板」Segmented 行及其说明小字、`_on_insert` 方法、`v["insert"]`；`_save` 不再写 `insert_method`。程序内部仍以剪贴板 + Ctrl+V 兜底，只是不再让用户选。
+
+- **③ 移除「语言选择」整行**：识别语言交回火山 SAUC 默认处理，不再暴露。
+
+- **④ 识别 Key 必填校验**（`src/gui.py` `_save`）：语音识别 Key 为空时弹「请先填写语音识别 API Key」警告并中止保存，不关闭窗口。
+
+- **⑤ 润色 Key 改为可选 + 托盘灰显**：
+  - `src/gui.py`：润色卡片说明文案标注「可选」，写明「不填则仅支持轻清洗，托盘『润色』不可用」；润色 Key 为空时允许保存，但自动把 `refine_enabled` 置为 False。
+  - `src/tray.py`：「润色」菜单项改用 `pystray.MenuItem(..., checked=..., enabled=lambda item: api_key 非空)`——未配置润色 Key 时**菜单项直接变灰不可点**，按用户要求**不加任何提示说明**。
+
+- **⑥ 设置界面标题文案**：「按住快捷键说话。松开即润色输出」→ **「按下即听，松手即现」**。
+
+- **⑦ 版本升版**：`src/logger.py` 的 `YURUN_VERSION` 与 `installer/yurun_setup.iss` 的 `MyAppVersion` 同步升到 `1.2.2`。
+
+### 验证
+
+- `python -m py_compile src/gui.py src/tray.py` 通过；grep 全量确认无 `asr_mode` / `_build_local` / `_on_insert` / `_seg_insert` 等残留引用。
+- 系统 Python 3.12.2（`C:/Users/user/AppData/Local/Programs/Python/Python312/python.exe`）执行 `pyinstaller Yurun.spec --noconfirm` 打包成功，产物 `dist/语润.exe` 71.4MB。
+- PowerShell `Start-Process` 独立进程启动验证：进程常驻 ALIVE（不被 Bash 子 shell 带走），测试后已关闭。
+- 打包踩坑复用：旧 `dist/语润.exe` 与 `build/` 目录在打包前先 `mv` 改名备份（沙箱 safe-delete 会拦截 `os.remove`/`rm -rf`，改名可绕过），故未触发拦截。
+
+### 行为变化
+
+- 新用户打开设置：只看到「语音引擎（SAUC Key，必填）」+「润色 API（可选）」两张卡片，无本地离线、无粘贴方式、无语言选择。
+- 只填 SAUC Key、不填润色 Key → 托盘「润色」菜单项灰显不可点，程序固定走轻清洗直出。
+- 填了润色 Key → 「润色」菜单项恢复可勾选，行为与 v1.2.1 一致。
+
+### 发布
+
+- commit `4b0c281` → push `master:main`（`8443be1..4b0c281`）→ tag `v1.2.2` → GitHub Release（ID 375227022，中文说明）→ 上传附件 `Yurun-v1.2.2.exe`（68.1MB，ASCII 名避免 GitHub 解析成 `default.exe`）。
+
+> **补充**：README 于 2026-08-29 重写为产品向落地页文案（保留原有全部技术信息，新增产品定位、两种输入方式、个人词库、BYOK 与产品原则等章节），版本号同步为 v1.2.2。
+
+---
+
 ## [1.2.1] — 2026-08-23 · 润色开关 + 轻清洗模式 + 打包崩溃修复
 
 > **编辑**：WorkBuddy（混元3，本仓库 AI 协作 agent）

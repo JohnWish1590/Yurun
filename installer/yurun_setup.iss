@@ -2,7 +2,7 @@
 ; 标准安装 + 彻底卸载（清 AppData/Yurun 目录，不含开机自启）
 
 #define MyAppName "语润"
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "1.3.1"
 #define MyAppPublisher "语润"
 #define MyAppExeName "语润.exe"
 

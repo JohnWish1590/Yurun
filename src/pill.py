@@ -83,7 +83,7 @@ def _cursor_screen_rect():
     return None
 
 
-def _caret_screen_rect():
+def _caret_screen_rect(anchor_hwnd=None):
     """返回光标（I 形插入符）的屏幕矩形 (l, t, r, b)。拿不到时返回 None。
 
     Chromium / Electron 应用的 caret 不一定暴露给 GetGUIThreadInfo，
@@ -95,7 +95,9 @@ def _caret_screen_rect():
       3. 鼠标位置 —— 兜底，pill 出现在用户最后点击处
     """
     try:
-        fg = _user32.GetForegroundWindow()
+        # 热键回调与浮窗显示之间，前台窗口有时会短暂变成 Tk 自己的隐藏窗口。
+        # 若主流程已记录录音开始时的输入窗口，优先用它取 caret，避免退化到左上角。
+        fg = anchor_hwnd or _user32.GetForegroundWindow()
         if not fg:
             _log.debug("caret: no foreground window → 鼠标兜底")
             return _cursor_screen_rect()
@@ -173,7 +175,7 @@ def _bg_is_light(carert_x, caret_top):
         return None
 
 
-def _compute_anchor():
+def _compute_anchor(anchor_hwnd=None):
     """计算气泡屏幕坐标 (x, y)。
 
     设计 C：气泡中线 = caret.x + OFFSET_X；竖直浮在光标正下方 GAP。
@@ -183,7 +185,7 @@ def _compute_anchor():
     sw = _user32.GetSystemMetrics(0)
     sh = _user32.GetSystemMetrics(1)
 
-    caret = _caret_screen_rect()
+    caret = _caret_screen_rect(anchor_hwnd)
     if caret:
         l, t, rr, b = caret
         caret_x = l
@@ -197,7 +199,7 @@ def _compute_anchor():
         return px, py
 
     # 无 caret：锚定到焦点窗口（输入框），贴其底部居中，固定不跟鼠标
-    fr = _focus_rect() or _foreground_rect()
+    fr = _focus_rect(anchor_hwnd) or _foreground_rect()
     if fr:
         l, t, rr, b = fr
         cx = (l + rr) // 2
@@ -219,16 +221,18 @@ def _compute_anchor():
     return (sw - W) // 2, sh - 90
 
 
-def _focus_rect():
+def _focus_rect(anchor_hwnd=None):
     """焦点窗口矩形（比跟随鼠标稳）：用于无 caret 时锚定输入框。"""
     try:
-        fg = _user32.GetForegroundWindow()
+        fg = anchor_hwnd or _user32.GetForegroundWindow()
         if not fg:
             return None
         tid = _user32.GetWindowThreadProcessId(fg, None)
         info = _GUITHREADINFO()
         info.cbSize = ctypes.sizeof(info)
-        if _user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+        if anchor_hwnd:
+            hwnd = anchor_hwnd
+        elif _user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
             hwnd = info.hwndFocus or info.hwndActive or fg
         else:
             hwnd = fg
@@ -273,6 +277,7 @@ class PillBubble:
         self._dot_pulse = 0.0
         self._warned_80 = False  # 录音 80s「还剩10秒」是否已提示
         self._light = False  # 当前主题（False=深色）
+        self._anchor_hwnd = None  # 本轮录音开始时的输入窗口，仅用于定位，不改变焦点
 
         self.win = tk.Toplevel(master)
         self.win.withdraw()
@@ -355,7 +360,7 @@ class PillBubble:
         self.win.attributes("-topmost", True)
 
     def _detect_and_apply_theme(self):
-        r = _caret_screen_rect()
+        r = _caret_screen_rect(self._anchor_hwnd)
         if r:
             light = _bg_is_light(r[0], r[1])
             if light is not None:
@@ -429,11 +434,15 @@ class PillBubble:
 
     def _reposition(self):
         """将气泡定位到当前光标正下方（带 OFFSET_X 偏移），每次进入活动态时调用。"""
-        x, y = _compute_anchor()
+        x, y = _compute_anchor(self._anchor_hwnd)
         try:
             self.win.geometry(f"{W}x{H}+{x}+{y}")
         except Exception:
             pass
+
+    def set_anchor_hwnd(self, hwnd):
+        """设置本轮浮窗的定位锚点；仅影响位置，不会激活或切换窗口。"""
+        self._anchor_hwnd = hwnd or None
 
     def _set_icon(self, which):
         self.canvas.itemconfig(self.dot, state="hidden" if which != "dot" else "normal")

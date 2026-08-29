@@ -89,6 +89,8 @@ class App:
 
         self.root = tk.Tk()
         self.root.withdraw()
+        # 设置窗口通过这个引用安全地请求热键重新注册；不需要全局变量。
+        self.root._yurun_app = self
         # DPI 缩放锁：捕获启动时的系统 font scaling（即 v1.0 原字号基准），
         # 睡眠唤醒/显示器变化导致 Tk 内部 scaling 漂移时还原回原值，字体不再整体放大或缩小。
         try:
@@ -113,6 +115,24 @@ class App:
         self.hotkey.on_hold_end = self._on_hold_end
         self.hotkey.on_error = lambda m: self.ui_q.put(("toast", m))
         self.hotkey.on_toggle = self._on_toggle
+
+    def apply_hotkey_settings(self, key_name, trigger_mode):
+        """立即验证并应用新的主热键/触发方式；失败时自动恢复旧热键。"""
+        old_key = self.cfg.get("hotkey") or "`"
+        old_mode = self.cfg.get("trigger_mode") or "hold"
+        self.hotkey.stop()
+        if self.hotkey.start(key_name, trigger_mode):
+            log.info("主热键已即时更新: %s (%s)", key_name, trigger_mode)
+            return True, ""
+
+        # 新键不可用时，不让应用失去原先可用的录音入口。
+        self.hotkey.stop()
+        restored = self.hotkey.start(old_key, old_mode)
+        if restored:
+            log.warning("新主热键不可用，已恢复: %s (%s)", old_key, old_mode)
+            return False, "该按键无法注册，已保留原来的热键。"
+        log.error("新旧热键均无法注册: new=%s old=%s", key_name, old_key)
+        return False, "该按键无法注册，原热键也未能恢复；请重启语润。"
 
     # ================= UI 事件泵 =================
     def pump(self):
@@ -156,11 +176,13 @@ class App:
             elif kind in ("done", "fallback"):
                 # 完成：直接隐藏 + 粘贴，pill 不显示预览文字；释放焦点锁定
                 self._target_hwnd = None
+                self.indicator.set_anchor_hwnd(None)
                 self._hide_partial()
                 self.indicator.force_idle()
             elif kind == "error":
                 # 错误结束：释放焦点锁定
                 self._target_hwnd = None
+                self.indicator.set_anchor_hwnd(None)
                 self._hide_partial()
                 self.indicator.show_error(evt[1] if len(evt) > 1 else "出错了")
             elif kind == "toast":
@@ -325,6 +347,8 @@ class App:
         # 焦点锁定（C1）：记录开始时的目标输入控件；录音/输入期间焦点被切走会抢回
         self._target_hwnd = self._get_target_hwnd()
         log.info("锁定目标窗口 hwnd=%s", self._target_hwnd)
+        # 只用于 pill / Partial 浮窗定位，避免 Tk 窗口短暂成为前台时退回屏幕左上角。
+        self.indicator.set_anchor_hwnd(self._target_hwnd)
         # 不再拦截"已有录音进行中"：允许前一句还在识别/润色时按下热键录下一句
         # （重叠录音）。hold 模式物理上同一键按住中不会再触发 WM_HOTKEY，
         # 所以这里每次按下都是独立的一次录音，配独立临时文件互不干扰。
@@ -403,6 +427,28 @@ class App:
         except Exception as e:
             log.warning("自动 Ctrl+C 失败: %s", e)
 
+    def _replace_correction_selection(self, correct, target_hwnd):
+        """将弹窗打开前的选区替换为 correct，并恢复用户原有剪贴板文本。"""
+        if not correct or not target_hwnd:
+            return False
+        backup = self._clipboard_backup()
+        try:
+            # 这是纠正操作本身的必要聚焦，不属于录音/输入流程的焦点策略。
+            if _user32.GetForegroundWindow() != target_hwnd:
+                self._steal_focus(target_hwnd)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(correct)
+            self.root.update()
+            import pyautogui
+            pyautogui.hotkey("ctrl", "v")
+            # Ctrl+V 消费完内容后再恢复，既不污染剪贴板也不打断替换。
+            self.root.after(180, lambda: self._clipboard_restore(backup))
+            return True
+        except Exception as exc:
+            self._clipboard_restore(backup)
+            log.warning("纠正替换当前选区失败: %s", exc)
+            return False
+
     def _kb_on_press(self, key):
         """pynput 钩子（后台线程）：Ctrl+反引号 → 纠错弹窗。防重复触发。
 
@@ -449,6 +495,12 @@ class App:
             self.ui_q.put(("error", "词库失败"))
             return
 
+        # 在创建弹窗前保存原应用窗口；确认时只把已选中的原文字替换掉。
+        try:
+            selection_hwnd = _user32.GetForegroundWindow()
+        except Exception:
+            selection_hwnd = None
+
         win = tk.Toplevel(self.root)
         win.withdraw()
         win.overrideredirect(True)
@@ -479,8 +531,9 @@ class App:
             _sel = ""
         finally:
             self._clipboard_restore(_backup)
-        if _sel and _sel.strip():
-            wrong_var.set(_sel.strip()[:120])
+        selected_text = (_sel or "").strip()
+        if selected_text:
+            wrong_var.set(selected_text[:120])
 
         # 圆角白底：canvas 用 place 铺满窗口作背景画圆角白底，body 不透明白底内缩
         # 8px 浮在上层。中间完全不透明遮住背后内容，外圈 8px 露出 canvas 圆角白底
@@ -559,7 +612,19 @@ class App:
                 log.error("存入词库失败: %s", ex)
                 status_var.set("存入失败")
                 return
-            status_var.set(f"已存入词库：{correct}")
+            # 只替换弹窗打开前实际选中的完整文本；没有选中或选区过长被界面截断时，
+            # 仍可安全保存词库，但绝不猜测并覆盖当前输入内容。
+            replaced = False
+            if selected_text and wrong == selected_text:
+                replaced = self._replace_correction_selection(correct, selection_hwnd)
+            if replaced:
+                status_var.set(f"已替换并存入词库：{correct}")
+                log.info("纠正已替换当前选区: wrong=%r correct=%r", wrong, correct)
+            elif selected_text:
+                status_var.set(f"已存入词库（当前文字未替换）：{correct}")
+                log.warning("纠正仅存词库，当前选区替换失败: wrong=%r correct=%r", wrong, correct)
+            else:
+                status_var.set(f"已存入词库：{correct}")
             win.after(1200, win.destroy)
 
         footer = tk.Frame(body, bg="#FFFFFF")
@@ -570,7 +635,7 @@ class App:
 
         # 占位 spacer 把按钮推到右侧；pack 顺序：先 right 的会后出现，因此先 pack 存入词库（最右），再 pack 取消（左侧）
         tk.Frame(footer, bg="#FFFFFF").pack(side="left", fill="x", expand=True)
-        PillButton(footer, "存入词库", _confirm, primary=True, min_w=110).pack(side="right")
+        PillButton(footer, "替换并存入词库", _confirm, primary=True, min_w=150).pack(side="right")
         PillButton(footer, "取消", lambda: win.destroy(), primary=False,
                    weight="normal", min_w=90).pack(side="right", padx=(0, 12))
 

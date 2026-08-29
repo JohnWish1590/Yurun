@@ -107,6 +107,9 @@ class HotkeyListener:
         self._thread = None
         self._poll_thread = None
         self._pressed = False
+        # start() 需要知道系统是否真的接受了 RegisterHotKey，不能只看线程是否已创建。
+        self._start_ready = threading.Event()
+        self._start_error = None
 
     def start(self, key_name: str, trigger_mode: str = "hold") -> bool:
         self._vk = _vk_for(key_name)
@@ -115,13 +118,23 @@ class HotkeyListener:
             return False
         self._key_name = key_name
         self.trigger_mode = trigger_mode
+        self._pressed = False
+        self._start_error = None
+        self._start_ready.clear()
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        return True
+        # 等待后台线程完成 RegisterHotKey，保存设置时才能真实地反馈“能否使用”。
+        if not self._start_ready.wait(timeout=1.5):
+            self.stop()
+            self._start_error = "启动超时"
+            return False
+        return self._running and self._start_error is None
 
     def _fail(self, msg: str):
         self._running = False
+        self._start_error = msg
+        self._start_ready.set()
         if self.on_error:
             try:
                 self.on_error(msg)
@@ -167,6 +180,8 @@ class HotkeyListener:
             log.warning("热键注册失败（错误码 %s），可能已被其他程序占用", err)
             self._fail("热键被占")  # pill 132 宽装不下长文案，显示 4 字短提示
             return
+
+        self._start_ready.set()
 
         if self.trigger_mode == "hold":
             self._poll_thread = threading.Thread(target=self._poll, daemon=True)

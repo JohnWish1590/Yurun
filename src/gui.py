@@ -1,4 +1,4 @@
-"""语润（Yurun）设置窗口 — Apple 风格（稳定版）。
+"""语润（Yurun）设置窗口。
 
 目标：在 Windows tkinter 上稳定还原《语润设置-Apple风格.html》的视觉，
 同时避免 Canvas+Frame 混合带来的尺寸/截字/层级问题。
@@ -33,7 +33,7 @@ HAIRLINE = "#E0E0E0"        # 输入框/取消按钮描边
 
 # ---- 字号（px，按 Windows 可读基准整体放大）----
 F_TITLE_BAR = 15
-F_APP_TITLE = 40
+F_APP_TITLE = 42
 F_SUBTITLE = 17
 F_CARD_TITLE = 20
 F_LABEL = 15
@@ -42,19 +42,18 @@ F_DESC = 14
 F_LINK = 15
 F_ROW = 17
 F_SEG = 15
-F_HOTKEY = 19
+F_HOTKEY = 22
 F_BTN = 16
 
 # ---- 间距 ----
-WIN_W = 640                 # 窗口固定宽度（放大版，给中文留余量）
-PAD_X = 32                  # 内容区左右内边距
+WIN_W = 780                 # 更宽的设置窗口，避免中文说明和输入控件拥挤
+PAD_X = 40                  # 内容区左右内边距
 PAD_TOP = 12
 PAD_BOTTOM = 28
-CARD_PAD = 24
-CARD_GAP = 24
+CARD_PAD = 28
+CARD_GAP = 22
 FIELD_GAP = 18
 BTN_GAP = 14
-TITLE_H = 40
 
 # ---- 字体解析（确保无衬线）----
 def _resolve_font_family():
@@ -210,7 +209,6 @@ class SettingsWindow:
         self.root.title("语润 · 设置")
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
-        self.root.overrideredirect(True)
         try:
             import os
             _ico = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -225,7 +223,8 @@ class SettingsWindow:
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.update_idletasks()
-        self._center_window()
+        if not self._restore_window_position():
+            self._center_window()
         self.root.deiconify()
 
     def _init_vars(self):
@@ -245,8 +244,6 @@ class SettingsWindow:
 
     # ================= 构建 =================
     def _build(self):
-        self._build_title_bar()
-
         self.body = tk.Frame(self.root, bg=BG)
         self.body.pack(fill="both", expand=True, padx=PAD_X, pady=(PAD_TOP, PAD_BOTTOM))
 
@@ -285,48 +282,10 @@ class SettingsWindow:
         inner.pack(fill="both", expand=True)
         return inner
 
-    def _build_title_bar(self):
-        tb = tk.Frame(self.root, bg=BG, height=TITLE_H)
-        tb.pack(fill="x")
-        tb.pack_propagate(False)
-        tb.grid_columnconfigure(1, weight=1)  # 标题列居中拉伸
-
-        lights = tk.Frame(tb, bg=BG)
-        specs = [("#FF5F57", self._on_close), ("#FEBC2E", None), ("#28C840", None)]
-        for color, act in specs:
-            c = tk.Canvas(lights, width=13, height=13, bg=BG,
-                          highlightthickness=0, bd=0, cursor="hand2")
-            c.create_oval(1, 1, 12, 12, fill=color, outline="")
-            if act:
-                c.bind("<Button-1>", lambda e, a=act: a())
-            c.pack(side="left", padx=(0, 8))
-        lights.grid(row=0, column=0, padx=16, sticky="w")
-
-        title = tk.Label(tb, text="语润 · 设置", bg=BG, fg=TEXT_DIM,
-                         font=FONT(F_TITLE_BAR))
-        title.grid(row=0, column=1)
-
-        # 右侧 spacer 与左侧交通灯宽度对称，确保标题真正居中
-        right_spacer = tk.Frame(tb, bg=BG, width=16 + 13 * 3 + 8 * 2)
-        right_spacer.grid(row=0, column=2, sticky="e")
-
-        for w in (tb, title, right_spacer, lights):
-            w.bind("<ButtonPress-1>", self._drag_start)
-            w.bind("<B1-Motion>", self._drag_move)
-
-    def _drag_start(self, e):
-        self._drag_x = e.x_root - self.root.winfo_x()
-        self._drag_y = e.y_root - self.root.winfo_y()
-
-    def _drag_move(self, e):
-        x = e.x_root - self._drag_x
-        y = e.y_root - self._drag_y
-        self.root.geometry(f"+{x}+{y}")
-
     def _compute_size(self):
         self.root.update_idletasks()
         req_h = self.body.winfo_reqheight()
-        h = req_h + TITLE_H + PAD_TOP + PAD_BOTTOM
+        h = req_h + PAD_TOP + PAD_BOTTOM
         sh = self.root.winfo_screenheight()
         return WIN_W, min(h, sh - 60)
 
@@ -336,6 +295,39 @@ class SettingsWindow:
         x = (sw - w) // 2
         y = max((sh - h) // 2, 0)
         self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _restore_window_position(self):
+        """恢复上次位置；显示器布局变化后，避免把窗口放到不可见区域。"""
+        saved = self.cfg.get("settings_window_position")
+        if not isinstance(saved, dict):
+            return False
+        try:
+            x, y = int(saved["x"]), int(saved["y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        w, h = self._compute_size()
+        # vroot 是 Windows 的整块虚拟桌面，包含扩展显示器和负坐标显示器。
+        vx, vy = self.root.winfo_vrootx(), self.root.winfo_vrooty()
+        vw, vh = self.root.winfo_vrootwidth(), self.root.winfo_vrootheight()
+        visible_margin = 120
+        if (x + visible_margin < vx or y + visible_margin < vy or
+                x > vx + vw - visible_margin or y > vy + vh - visible_margin):
+            return False
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        return True
+
+    def _remember_window_position(self):
+        """在关闭或保存前记录位置，下一次打开设置时恢复。"""
+        try:
+            self.root.update_idletasks()
+            self.cfg.set("settings_window_position", {
+                "x": self.root.winfo_x(),
+                "y": self.root.winfo_y(),
+            })
+        except Exception:
+            # 位置记忆不能影响正常保存或退出。
+            pass
 
     def _refit(self):
         w, h = self._compute_size()
@@ -358,8 +350,8 @@ class SettingsWindow:
 
     def _build_cloud(self, parent):
         v = self._var
-        self._field(parent, "API Key", v["sauc_key"], show="*")
-        tk.Label(parent, text="火山引擎语音技术 · 流式语音识别（SAUC），与 Cindy 同款",
+        self._key_field(parent, "API Key", v["sauc_key"], self._confirm_sauc_key)
+        tk.Label(parent, text="必填。输入或更换后，点击右侧“确定”立即保存。",
                  bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC)).pack(anchor="w", pady=(8, 0))
 
         self._adv_btn = tk.Label(parent, text="高级（端点 / 资源ID 已预填）", bg=CARD,
@@ -375,9 +367,9 @@ class SettingsWindow:
     # ---------- 润色 ----------
     def _build_refine(self, card):
         v = self._var
-        self._card_header(card, "润色 API（可选）")
-        self._field(card, "API Key", v["refine_key"], show="*")
-        tk.Label(card, text="智能整理 API Key（可选，OpenAI 兼容，sk-/ark- 等均可）。不填时仍可使用快速输入，托盘「智能整理」不可用。",
+        self._card_header(card, "智能整理 API（可选）")
+        self._key_field(card, "API Key", v["refine_key"], self._confirm_refine_key)
+        tk.Label(card, text="可选，兼容 OpenAI 的 sk-/ark- 等 Key。输入或更换后点击“确定”；不填仍可快速输入。",
                  bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC)).pack(anchor="w", pady=(8, 0))
 
         self._refine_adv_btn = tk.Label(card, text="高级（Base URL / 模型 已预填）", bg=CARD,
@@ -393,26 +385,50 @@ class SettingsWindow:
     # ---------- 热键 ----------
     def _build_hotkey(self, card):
         v = self._var
-        self._card_header(card, "快捷键与行为")
+        self._card_header(card, "输入控制")
+        tk.Label(card, text="这两项会立即验证并应用；无法使用的按键不会覆盖当前可用设置。",
+                 bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC)).pack(anchor="w", pady=(0, FIELD_GAP))
 
-        row = tk.Frame(card, bg=CARD)
-        row.pack(fill="x", pady=(0, FIELD_GAP))
-        tk.Label(row, text="热键", bg=CARD, fg=TEXT, font=FONT(F_ROW)).pack(side="left")
-        self._hotkey_entry = tk.Entry(row, textvariable=v["hotkey"], font=FONT(F_HOTKEY, "bold"),
+        hotkey_box = tk.Frame(card, bg=SURFACE_PEARL, highlightbackground=HAIRLINE,
+                              highlightthickness=1, bd=0)
+        hotkey_box.pack(fill="x", pady=(0, FIELD_GAP))
+        hotkey_inner = tk.Frame(hotkey_box, bg=SURFACE_PEARL, padx=20, pady=18)
+        hotkey_inner.pack(fill="x")
+        tk.Label(hotkey_inner, text="主热键", bg=SURFACE_PEARL, fg=TEXT,
+                 font=FONT(F_ROW, "bold")).pack(anchor="w")
+        tk.Label(hotkey_inner, text="按下它开始语音输入。支持 `、CapsLock、F1–F12、字母、数字和常用符号。",
+                 bg=SURFACE_PEARL, fg=TEXT_DIM, font=FONT(F_DESC)).pack(anchor="w", pady=(4, 12))
+        key_row = tk.Frame(hotkey_inner, bg=SURFACE_PEARL)
+        key_row.pack(fill="x")
+        self._hotkey_entry = tk.Entry(key_row, textvariable=v["hotkey"], font=FONT(F_HOTKEY, "bold"),
                                       bg=CARD, fg=TEXT, insertbackground=TEXT,
                                       relief="flat", highlightthickness=1, bd=0,
                                       highlightbackground=HAIRLINE,
-                                      highlightcolor=ACCENT_HOVER, width=6,
+                                      highlightcolor=ACCENT_HOVER, width=14,
                                       justify="center")
-        self._hotkey_entry.pack(side="right", ipady=10)
+        self._hotkey_entry.pack(side="left", ipady=11)
+        tk.Label(key_row, text="常用", bg=SURFACE_PEARL, fg=TEXT_DIM,
+                 font=FONT(F_DESC)).pack(side="left", padx=(20, 8))
+        for label, key in (("反引号", "`"), ("Caps Lock", "CapsLock"), ("F8", "F8")):
+            chip = tk.Label(key_row, text=label, bg=CARD, fg=ACCENT, cursor="hand2",
+                            font=FONT(F_DESC, "bold"), padx=11, pady=7,
+                            highlightbackground=HAIRLINE, highlightthickness=1)
+            chip.pack(side="left", padx=(0, 8))
+            chip.bind("<Button-1>", lambda _event, value=key: self._set_hotkey(value))
 
-        row2 = tk.Frame(card, bg=CARD)
-        row2.pack(fill="x", pady=(0, FIELD_GAP))
-        tk.Label(row2, text="触发方式", bg=CARD, fg=TEXT, font=FONT(F_ROW)).pack(side="left")
-        seg = Segmented(row2, [("hold", "按住说话"), ("toggle", "单击切换")],
-                        self._on_trigger, v["trigger"].get())
-        seg.pack(side="right")
+        tk.Label(card, text="触发方式", bg=CARD, fg=TEXT,
+                 font=FONT(F_ROW, "bold")).pack(anchor="w", pady=(2, 10))
+        seg = Segmented(card, [("hold", "按住说话（推荐）"), ("toggle", "单击开始 / 再按结束")],
+                        self._on_trigger, v["trigger"].get(), height=44)
+        seg.pack(anchor="w")
         self._seg_trigger = seg
+        self._trigger_hint = tk.Label(card, bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC))
+        self._trigger_hint.pack(anchor="w", pady=(10, 0))
+        self._update_trigger_hint()
+
+        correction = tk.Label(card, text="纠正快捷键：Ctrl + `（固定），用于修正已选中的文字。",
+                              bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC))
+        correction.pack(anchor="w", pady=(FIELD_GAP, 0))
 
     # ================= 控件 =================
     def _entry(self, parent, var, width=None, show=None):
@@ -433,9 +449,52 @@ class SettingsWindow:
         e.pack(fill="x", pady=(10, 0), ipady=12)
         return e
 
+    def _key_field(self, parent, label, var, confirm):
+        """API Key 专用行：输入框后提供独立的确认保存按钮。"""
+        grp = tk.Frame(parent, bg=CARD)
+        grp.pack(fill="x", pady=(0, FIELD_GAP))
+        tk.Label(grp, text=label, bg=CARD, fg=TEXT_LABEL,
+                 font=FONT(F_LABEL, "bold")).pack(anchor="w")
+        row = tk.Frame(grp, bg=CARD)
+        row.pack(fill="x", pady=(10, 0))
+        entry = self._entry(row, var, show="*")
+        entry.pack(side="left", fill="x", expand=True, ipady=12)
+        PillButton(row, "确定", confirm, height=46, min_w=88).pack(side="right", padx=(12, 0))
+        return entry
+
     # ================= 交互 =================
     def _on_trigger(self, value):
         self._var["trigger"].set(value)
+        self._update_trigger_hint()
+
+    def _update_trigger_hint(self):
+        if self._var["trigger"].get() == "toggle":
+            text = "单击一次开始录音；再次单击同一热键后结束并输出文字。"
+        else:
+            text = "按住时录音，松开后识别并输入文字。适合大多数日常输入。"
+        self._trigger_hint.configure(text=text)
+
+    def _set_hotkey(self, value):
+        self._var["hotkey"].set(value)
+        self._hotkey_entry.focus_set()
+        self._hotkey_entry.selection_range(0, "end")
+
+    def _confirm_sauc_key(self):
+        key = self._var["sauc_key"].get().strip()
+        if not key:
+            messagebox.showwarning("语润", "请先输入语音识别 API Key。", parent=self.root)
+            return
+        self.cfg.set("asr_provider", "sauc")
+        self.cfg.set("asr_sauc_key", key)
+        messagebox.showinfo("语润", "语音识别 API Key 已保存。", parent=self.root)
+
+    def _confirm_refine_key(self):
+        key = self._var["refine_key"].get().strip()
+        if not key:
+            messagebox.showwarning("语润", "请先输入智能整理 API Key。", parent=self.root)
+            return
+        self.cfg.set("api_key", key)
+        messagebox.showinfo("语润", "智能整理 API Key 已保存。", parent=self.root)
 
     def _toggle_adv(self):
         self._adv_visible = not self._adv_visible
@@ -461,6 +520,22 @@ class SettingsWindow:
         if not sauc_key:
             messagebox.showwarning("语润", "请先填写语音识别 API Key", parent=self.root)
             return
+        hotkey = v["hotkey"].get().strip() or "`"
+        trigger_mode = v["trigger"].get()
+        try:
+            from hotkey import _vk_for
+            if not _vk_for(hotkey):
+                raise ValueError
+        except Exception:
+            messagebox.showwarning("语润", "热键无效。请使用 `、CapsLock、F1–F12、字母、数字或常用符号。", parent=self.root)
+            return
+
+        app = getattr(self.master, "_yurun_app", None)
+        if app is not None:
+            ok, reason = app.apply_hotkey_settings(hotkey, trigger_mode)
+            if not ok:
+                messagebox.showwarning("语润", reason, parent=self.root)
+                return
         c.set("asr_provider", "sauc")
         c.set("asr_sauc_key", sauc_key)
         c.set("asr_sauc_resource_id", v["sauc_resource"].get().strip())
@@ -474,13 +549,16 @@ class SettingsWindow:
             c.set("refine_enabled", False)
             if c.get("input_mode", "direct") == "refine":
                 c.set("input_mode", "direct")
-        c.set("hotkey", v["hotkey"].get().strip() or "`")
-        c.set("trigger_mode", v["trigger"].get())
-        messagebox.showinfo("语润", "设置已保存", parent=self.root)
+        c.set("hotkey", hotkey)
+        c.set("trigger_mode", trigger_mode)
+        self._remember_window_position()
+        applied = "热键已立即生效" if app is not None else "设置将在下次启动时生效"
+        messagebox.showinfo("语润", f"设置已保存，{applied}", parent=self.root)
         self.root.destroy()
 
     def _on_close(self):
         try:
+            self._remember_window_position()
             self.root.destroy()
         except Exception:
             pass

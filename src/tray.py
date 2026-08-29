@@ -11,13 +11,17 @@ from PIL import Image, ImageDraw
 from logger import logs_dir
 
 # 在模块加载时解析图标路径（避免 @staticmethod 内 __file__ 作用域歧义）
-def _resolve_icon():
+def _resolve_tray_icon():
     try:
         if getattr(sys, "frozen", False):
             base = getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
         else:
             base = Path(__file__).resolve().parent
         cands = [
+            Path(base).parent / "assets" / "tray_16.png",
+            Path(base) / "assets" / "tray_16.png",
+            Path(base).parent / "assets" / "tray.ico",
+            Path(base) / "assets" / "tray.ico",
             Path(base).parent / "assets" / "icon.ico",
             Path(base) / "assets" / "icon.ico",
         ]
@@ -28,7 +32,7 @@ def _resolve_icon():
         pass
     return None
 
-ASSETS_ICON = _resolve_icon()
+ASSETS_TRAY_ICON = _resolve_tray_icon()
 
 
 class Tray:
@@ -41,16 +45,18 @@ class Tray:
 
     @staticmethod
     def _icon_path():
-        """返回 favicon.ico 的绝对路径（开发/打包两种模式）。"""
-        return ASSETS_ICON
+        """返回专用 16×16 托盘图标路径（开发/打包两种模式）。"""
+        return ASSETS_TRAY_ICON
 
     @staticmethod
-    def _make_image(size=64):
-        """加载项目图标 assets/icon.ico（favicon，含多尺寸 + 透明）。"""
+    def _make_image(size=16):
+        """优先加载专用 16×16 托盘图标；缺失时回退主图标。"""
         try:
-            ico = Tray._icon_path()
-            if ico:
-                img = Image.open(ico).convert("RGBA").resize((size, size), Image.LANCZOS)
+            icon_path = Tray._icon_path()
+            if icon_path:
+                img = Image.open(icon_path).convert("RGBA")
+                if img.size != (size, size):
+                    img = img.resize((size, size), Image.LANCZOS)
                 return img
         except Exception:
             pass

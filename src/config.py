@@ -43,6 +43,8 @@ DEFAULTS = {
     "hotkey": "`",                     # 默认反引号
     "trigger_mode": "hold",            # hold=按住说话 / toggle=单击开关
     "correction_hotkey": "`",          # 纠错热键（Ctrl+此键 弹「错误纠正」框）
+    # 设置窗口上一次正常关闭时的位置。仅保存坐标，窗口尺寸由界面自动计算。
+    "settings_window_position": None,
     # 其他
     "auto_start": False,
     "proxy": "",                       # 留空=不走代理，如 http://127.0.0.1:7897

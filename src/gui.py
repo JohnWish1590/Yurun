@@ -377,7 +377,7 @@ class SettingsWindow:
         v = self._var
         self._card_header(card, "润色 API（可选）")
         self._field(card, "API Key", v["refine_key"], show="*")
-        tk.Label(card, text="润色 API Key（可选，OpenAI 兼容，sk-/ark- 等均可）。不填则仅支持轻清洗，托盘「润色」不可用。",
+        tk.Label(card, text="智能整理 API Key（可选，OpenAI 兼容，sk-/ark- 等均可）。不填时仍可使用快速输入，托盘「智能整理」不可用。",
                  bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC)).pack(anchor="w", pady=(8, 0))
 
         self._refine_adv_btn = tk.Label(card, text="高级（Base URL / 模型 已预填）", bg=CARD,
@@ -469,9 +469,11 @@ class SettingsWindow:
         c.set("api_key", refine_key)
         c.set("api_base", v["refine_base"].get().strip())
         c.set("api_model", v["refine_model"].get().strip())
-        # 润色 Key 未填 → 强制关闭润色（无 key 无法润色）
+        # 智能整理 Key 未填时，保留旧字段兼容，同时回到可用的快速输入模式。
         if not refine_key:
             c.set("refine_enabled", False)
+            if c.get("input_mode", "direct") == "refine":
+                c.set("input_mode", "direct")
         c.set("hotkey", v["hotkey"].get().strip() or "`")
         c.set("trigger_mode", v["trigger"].get())
         messagebox.showinfo("语润", "设置已保存", parent=self.root)

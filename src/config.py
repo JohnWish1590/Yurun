@@ -26,6 +26,8 @@ DEFAULTS = {
     "api_base": "https://api.deepseek.com/v1",
     "api_model": "deepseek-chat",
     "refine_enabled": True,
+    # Phase 0：Direct 是新配置的默认输入模式；旧字段保留给迁移使用。
+    "input_mode": "direct",
     "custom_instructions": "",
     # 语音识别：local=本地 Whisper / cloud=云端 ASR（OpenAI 兼容 /v1/audio/transcriptions）
     "asr_provider": "sauc",           # sauc=火山SAUC流式(Cindy同款,默认) / cloud=OpenAI兼容 / local=本地
@@ -61,6 +63,16 @@ class Config:
                 saved = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(saved, dict):
                     self.data.update({k: v for k, v in saved.items() if k in DEFAULTS})
+                    # 最小兼容迁移：已有 input_mode 优先；旧配置保留既有行为。
+                    if "input_mode" not in saved:
+                        self.data["input_mode"] = (
+                            "refine" if bool(saved.get("refine_enabled", True)) else "direct"
+                        )
+                    elif self.data.get("input_mode") not in ("direct", "refine"):
+                        log.warning("无效 input_mode=%r，回退 direct", self.data.get("input_mode"))
+                        self.data["input_mode"] = "direct"
+                    if "input_mode" not in saved:
+                        self.save()
             except Exception:
                 pass
 

@@ -8,6 +8,7 @@
 日志：%APPDATA%\\Yurun\\logs\\yurun.log
 """
 import ctypes
+import json
 import os
 import queue
 import sys
@@ -27,6 +28,7 @@ from hotkey import get_hotkey
 from logger import (
     get_logger,
     install_crash_handler,
+    logs_dir,
     register_tk_error,
     log_startup_banner,
 )
@@ -77,6 +79,13 @@ class App:
         self._type_buf = ""
         self._typing = False
         self._type_on_done = None
+        self._type_round_id = None
+        self._type_interval_ms = 40
+        # Phase 0：仅记录插入体验，复用既有 round_id，不改变 _round_seq 的生命周期。
+        self._keyup_times = {}
+        self._insert_metrics = {}
+        self._streaming_rounds = set()
+        self._stream_complete_rounds = set()
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -94,7 +103,7 @@ class App:
         self.tray = tray_mod.Tray(
             on_quit=self._on_quit,
             on_open_settings=self._open_settings,
-            on_toggle_refine=self._toggle_refine,
+            on_set_input_mode=self._set_input_mode,
         )
         tray_mod._tray_instance = self.tray
 
@@ -164,12 +173,18 @@ class App:
                 # 模型加载完成/失败都直接隐藏，不在 pill 里显示文字
                 self.indicator.force_idle()
             elif kind == "type_partial":
-                self._do_type(evt[1])
+                self._do_type(evt[1], round_id=(evt[2] if len(evt) > 2 else None))
+            elif kind == "stream_insert_done":
+                self._complete_stream_insert(evt[1] if len(evt) > 1 else None)
             elif kind == "partial_preview":
                 # Phase 1：SAUC 实时中间结果，仅打测试浮窗，不进输入主路径
                 self._show_partial(evt[1])
             elif kind == "paste":
-                self._do_paste(evt[1], hide=(evt[2] if len(evt) > 2 else True))
+                self._do_paste(
+                    evt[1],
+                    hide=(evt[2] if len(evt) > 2 else True),
+                    round_id=(evt[3] if len(evt) > 3 else None),
+                )
             elif kind == "replace_paste":
                 # 方案B：润色完成走 ("paste", final, True)，不再产生 replace_paste 事件。
                 # 此分支保留仅作防御；若意外触发，按原 replace 语义处理。
@@ -331,6 +346,9 @@ class App:
     def _on_hold_end(self, _key):
         log.info("热键松开，停止录音")
         if self._rec_stop is not None:
+            round_id = self._round_seq
+            self._keyup_times[round_id] = time.perf_counter()
+            log.info("insert_metric round_id=%s event=keyup", round_id)
             self._rec_stop.set()
             self._rec_stop = None
 
@@ -845,14 +863,14 @@ class App:
         from dictionary import apply_local_replace
         text = apply_local_replace(text)
 
-        # 总闸：润色关闭 → 轻清洗（去口水词 + 剥句末标点）直出，不调 LLM、秒出。
-        # 不显示「正在润色」气泡（轻清洗毫秒级，显示中间态反而晃眼）。
+        # Phase 0 总闸：Direct 是默认主路径；智能整理仅在用户主动选择时进入。
+        # Direct 不显示「正在润色」气泡，轻清洗后立即输入。
         cfg = get_config()
-        if not cfg.get("refine_enabled", True):
+        if self._input_mode() == "direct":
             from refiner import light_clean
             final = light_clean(text)
             log.info("轻清洗直出: %s", final)
-            self.ui_q.put(("paste", final, True))
+            self.ui_q.put(("paste", final, True, round_id))
             return
 
         if self._refine_will_change(text):
@@ -864,7 +882,7 @@ class App:
             ).start()
         else:
             # 不会改动（太短/未配置/无自定义指令且较短）：原文即最终结果，立即贴出+收尾。
-            self.ui_q.put(("paste", text, True))
+            self.ui_q.put(("paste", text, True, round_id))
 
     def _refine_will_change(self, text) -> bool:
         """预估这次润色是否可能产生改动（用于决定是否显示「正在润色」）。
@@ -873,7 +891,7 @@ class App:
         （bypass_short）。这些走原文本、不等 LLM，pill 立即收尾。
         """
         cfg = get_config()
-        if not cfg.get("refine_enabled", True) or not cfg.get("api_key"):
+        if self._input_mode() != "refine" or not cfg.get("api_key"):
             return False
         custom = cfg.get("custom_instructions", "") or ""
         if not custom:
@@ -907,7 +925,7 @@ class App:
         # LLM 输出兜底：万一模型没遵守「数字不补句号」规则，同样剥掉。
         from refiner import strip_numeric_trailing_punct
         final = strip_numeric_trailing_punct(final)
-        self.ui_q.put(("paste", final, True))
+        self.ui_q.put(("paste", final, True, round_id))
 
     def _refine_stream_and_paste(self, text, round_id):
         """流式润色：边收 delta 边逐段 SendInput，首字即上屏；首字前失败回退整段。"""
@@ -915,12 +933,15 @@ class App:
         from dictionary import to_llm_text
         cfg = get_config()
         t_rf0 = time.time()
+        if round_id is not None:
+            self._streaming_rounds.add(round_id)
+            self._insert_metrics.setdefault(round_id, {"text_length": 0, "streaming": True})
 
         def on_delta(seg):
             # 过期则不再投递新分片（已贴部分保留，但不继续覆盖新内容）
             if round_id is not None and round_id != self._round_seq:
                 return
-            self.ui_q.put(("type_partial", seg))
+            self.ui_q.put(("type_partial", seg, round_id))
 
         try:
             result = refine_stream(
@@ -941,15 +962,19 @@ class App:
         log.info("流式润色耗时=%.2fs ok=%s reason=%s", time.time() - t_rf0, result["ok"], result.get("reason"))
 
         if result["ok"]:
-            # 已通过 on_delta 逐段贴出（完整或部分），直接收尾。
+            # 等最后一个流式分片真正投递完，再记录 insert_done 并收尾。
+            self.ui_q.put(("stream_insert_done", round_id))
             self.ui_q.put(("done", text))
         else:
+            if round_id is not None:
+                self._streaming_rounds.discard(round_id)
+                self._stream_complete_rounds.discard(round_id)
             # 首字前失败：回退整段润色（此时尚未贴任何字，安全）。
             fallback = self._refine(text)
             final = fallback["text"] if fallback["ok"] else text
             from refiner import strip_numeric_trailing_punct
             final = strip_numeric_trailing_punct(final)
-            self.ui_q.put(("paste", final, True))
+            self.ui_q.put(("paste", final, True, round_id))
 
     def _transcribe(self, wav_path, cfg):
         """按配置选择识别引擎：cloud=云端 ASR / local=本地 Whisper。"""
@@ -987,7 +1012,7 @@ class App:
 
     def _refine(self, text):
         cfg = get_config()
-        if not cfg.get("refine_enabled", True) or not cfg.get("api_key"):
+        if self._input_mode() != "refine" or not cfg.get("api_key"):
             return {"ok": False, "text": text, "reason": "no_api_key"}
         try:
             from refiner import refine_text
@@ -1006,7 +1031,93 @@ class App:
             log.error("润色调用异常: %s", e)
             return {"ok": False, "text": text, "reason": "exception"}
 
-    def _do_type(self, text):
+    def _animation_interval_ms(self, text_length):
+        """保留短句 40ms/字手感；中长文本按总预算自动加速。"""
+        if text_length <= 0:
+            return 0
+        if text_length <= 15:
+            budget_ms = text_length * 40
+        elif text_length <= 40:
+            budget_ms = 600
+        elif text_length <= 80:
+            budget_ms = 700
+        else:
+            # 81 字起从 800ms 平滑增长，161 字及以上封顶 1000ms。
+            budget_ms = min(1000, 800 + max(0, text_length - 81) * 2.5)
+        # 8ms 是 SendInput/Tk 调度的安全下限；40ms 保留短句基准手感。
+        return max(8, min(40, int(round(budget_ms / text_length))))
+
+    def _record_insert_start(self, round_id, text):
+        if round_id is None:
+            return
+        metric = self._insert_metrics.setdefault(round_id, {"text_length": len(text or "")})
+        if metric.get("streaming"):
+            metric["text_length"] = metric.get("text_length", 0) + len(text or "")
+        if metric.get("start") is not None:
+            return
+        now = time.perf_counter()
+        metric["start"] = now
+        if not metric.get("streaming"):
+            metric["text_length"] = len(text or "")
+        log.info("insert_metric round_id=%s mode=%s text_length=%s event=insert_start",
+                 round_id, self._input_mode(), metric["text_length"])
+        self._write_insert_metric("insert_start", round_id, metric)
+
+    def _record_first_insert(self, round_id):
+        if round_id is None:
+            return
+        metric = self._insert_metrics.get(round_id)
+        if not metric or metric.get("first") is not None:
+            return
+        now = time.perf_counter()
+        metric["first"] = now
+        keyup = self._keyup_times.get(round_id)
+        ttfi_ms = (now - keyup) * 1000.0 if keyup is not None else float("nan")
+        log.info("insert_metric round_id=%s mode=%s text_length=%s event=first_insert ttfi_ms=%.0f",
+                 round_id, self._input_mode(), metric.get("text_length", 0), ttfi_ms)
+        self._write_insert_metric("first_insert", round_id, metric, ttfi_ms=ttfi_ms)
+
+    def _record_insert_done(self, round_id):
+        if round_id is None:
+            return
+        metric = self._insert_metrics.get(round_id)
+        if not metric or metric.get("done") is not None:
+            return
+        now = time.perf_counter()
+        metric["done"] = now
+        keyup = self._keyup_times.get(round_id)
+        ttci_ms = (now - keyup) * 1000.0 if keyup is not None else float("nan")
+        log.info("insert_metric round_id=%s mode=%s text_length=%s event=insert_done ttci_ms=%.0f",
+                 round_id, self._input_mode(), metric.get("text_length", 0), ttci_ms)
+        self._write_insert_metric("insert_done", round_id, metric, ttci_ms=ttci_ms)
+
+    def _write_insert_metric(self, event, round_id, metric, **durations):
+        """KPI 专用脱敏落盘：不依赖通用日志，绝不保存转写文本。"""
+        record = {
+            "timestamp_ms": int(time.time() * 1000),
+            "round_id": round_id,
+            "event": event,
+            "input_mode": self._input_mode(),
+            "text_length": metric.get("text_length", 0),
+        }
+        record.update({key: round(value, 1) for key, value in durations.items()})
+        try:
+            with (logs_dir() / "insert-metrics.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            log.warning("插入指标落盘失败: %s", exc)
+
+    def _complete_stream_insert(self, round_id):
+        """流式润色结束信号：等待缓冲区清空后才算完整输入。"""
+        if round_id is None:
+            return
+        self._stream_complete_rounds.add(round_id)
+        if not self._typing and not self._type_buf:
+            self._record_insert_done(round_id)
+            self._streaming_rounds.discard(round_id)
+            self._stream_complete_rounds.discard(round_id)
+
+    def _do_type(self, text, round_id=None):
         """主线程：SendInput 逐字输入一段文本（流式分片），不隐藏 pill、不发 done。
 
         用 char_interval 逐字投递，模拟人打字节奏——即使模型生成很快，文字也按固定节奏
@@ -1027,16 +1138,23 @@ class App:
                 log.debug("流式打字链收到片段: len=%d", len(text) if text else 0)
             except Exception:
                 pass
-            self._enqueue_type(text)
+            self._enqueue_type(text, round_id=round_id)
         except Exception as e:
             log.warning("流式 SendInput 输入失败: %s", e)
 
-    def _enqueue_type(self, text, on_done=None):
+    def _enqueue_type(self, text, on_done=None, round_id=None):
         """把文本追加到打字缓冲区并启动异步打字链（单链，避免多段并发错序）。"""
         # ③ 切窗口兜底：打字前把焦点抢回录音时锁定的原窗口
         if self._target_hwnd and _user32.GetForegroundWindow() != self._target_hwnd:
             self._steal_focus(self._target_hwnd)
+        self._record_insert_start(round_id, text)
         self._type_buf += text
+        if round_id is not None:
+            self._type_round_id = round_id
+        interval_ms = self._animation_interval_ms(len(text or ""))
+        if interval_ms:
+            self._type_interval_ms = interval_ms
+            self._drain_interval = max(8, int(interval_ms * 0.75))
         if on_done is not None:
             self._type_on_done = on_done
         if not self._typing:
@@ -1048,6 +1166,14 @@ class App:
     def _type_step(self):
         if not self._type_buf:
             self._typing = False
+            round_id = self._type_round_id
+            if round_id in self._stream_complete_rounds:
+                self._record_insert_done(round_id)
+                self._streaming_rounds.discard(round_id)
+                self._stream_complete_rounds.discard(round_id)
+            elif round_id not in self._streaming_rounds:
+                self._record_insert_done(round_id)
+            self._type_round_id = None
             cb = self._type_on_done
             self._type_on_done = None
             self._finish_partial_drain()
@@ -1061,14 +1187,16 @@ class App:
         self._type_buf = self._type_buf[1:]
         try:
             from typer import type_text
-            type_text(ch)
+            sent = type_text(ch)
+            if sent >= 2:
+                self._record_first_insert(self._type_round_id)
         except Exception as e:
             log.warning("逐字 SendInput 失败: %s", e)
         # 删字不再绑定打字步（那样会和打字同速，显得"一下没"）；
         # 改由独立的慢速定时器（_drain_timer_step）驱动，明显慢于打字，逐字吸走可见。
-        self.root.after(40, self._type_step)
+        self.root.after(self._type_interval_ms, self._type_step)
 
-    def _do_paste(self, text, hide=True, replace=False):
+    def _do_paste(self, text, hide=True, replace=False, round_id=None):
         """主线程：把 text 送进当前焦点窗口。
 
         - hide=True：粘贴后隐藏 pill（终态）。
@@ -1092,6 +1220,7 @@ class App:
                 self._enqueue_type(
                     text,
                     on_done=(lambda: self.ui_q.put(("done", text))) if hide else None,
+                    round_id=round_id,
                 )
                 return
             except Exception as e:
@@ -1099,6 +1228,7 @@ class App:
                 # 落到下面的 paste 路径作兜底
 
         # paste 路径（兜底或用户显式选择）：写剪贴板 + Ctrl+V
+        self._record_insert_start(round_id, text)
         # ③ 切窗口兜底：粘贴前抢回焦点，字进原窗口
         if self._target_hwnd and _user32.GetForegroundWindow() != self._target_hwnd:
             self._steal_focus(self._target_hwnd)
@@ -1120,6 +1250,8 @@ class App:
             else:
                 pyautogui.hotkey("ctrl", "v")
                 log.info("Ctrl+V 已发送")
+            self._record_first_insert(round_id)
+            self._record_insert_done(round_id)
             # 浮窗收尾（若有剩字），再发 done（done 不会打断收尾）
             pass  # 收尾交给异步打字链（_enqueue_type → _type_step → _finish_partial_drain）
             if hide:
@@ -1132,6 +1264,8 @@ class App:
                 subprocess.Popen(["powershell", "-Command",
                     "Add-Type -AssemblyName System.Windows.Forms; "
                     "[System.Windows.Forms.SendKeys]::SendWait('" + ks + "')"])
+                self._record_first_insert(round_id)
+                self._record_insert_done(round_id)
                 self.ui_q.put(("done", text))
             except Exception as e2:
                 log.error("备用粘贴失败: %s", e2)
@@ -1167,17 +1301,26 @@ class App:
         except Exception as e:
             log.error("打开设置失败: %s", e)
 
-    def _toggle_refine(self):
-        """托盘「润色」勾选项回调：翻转 refine_enabled 并持久化到 config.json。
-        在后台托盘线程被调用，config.save() 是文件写、线程安全足够。
-        """
+    def _input_mode(self):
+        mode = self.cfg.get("input_mode", "direct")
+        if mode not in ("direct", "refine"):
+            log.warning("无效 input_mode=%r，按 direct 处理", mode)
+            return "direct"
+        return mode
+
+    def _set_input_mode(self, mode):
+        """托盘模式选择回调：立即持久化，且永远只保留一种输入模式。"""
+        if mode not in ("direct", "refine"):
+            log.warning("拒绝未知输入模式: %r", mode)
+            return
         try:
             cfg = get_config()
-            cur = bool(cfg.get("refine_enabled", True))
-            cfg.set("refine_enabled", not cur)
-            log.info("润色开关切换: %s -> %s", cur, not cur)
+            old = cfg.get("input_mode", "direct")
+            cfg.set("input_mode", mode)
+            self.cfg = cfg
+            log.info("输入模式切换: %s -> %s", old, mode)
         except Exception as e:
-            log.error("切换润色开关失败: %s", e)
+            log.error("切换输入模式失败: %s", e)
 
     # ================= 启动 =================
     def _warmup(self):

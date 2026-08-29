@@ -32,11 +32,11 @@ ASSETS_ICON = _resolve_icon()
 
 
 class Tray:
-    def __init__(self, on_quit=None, on_open_settings=None, on_toggle_refine=None):
+    def __init__(self, on_quit=None, on_open_settings=None, on_set_input_mode=None):
         self._icon = None
         self._on_quit = on_quit
         self._on_open_settings = on_open_settings
-        self._on_toggle_refine = on_toggle_refine
+        self._on_set_input_mode = on_set_input_mode
         self._lock = threading.Lock()
 
     @staticmethod
@@ -62,10 +62,15 @@ class Tray:
             pystray.MenuItem("打开设置", lambda: self._safe(self._on_open_settings)),
             pystray.MenuItem("打开日志目录", lambda: self._safe(self._open_logs)),
             pystray.MenuItem(
-                "润色",
-                lambda item: self._safe(lambda: self._toggle_refine()),
-                checked=lambda item: self._refine_checked(),
-                enabled=lambda item: self._refine_enabled(),
+                "快速输入",
+                lambda item: self._safe(lambda: self._set_input_mode("direct")),
+                checked=lambda item: self._mode_checked("direct"),
+            ),
+            pystray.MenuItem(
+                "智能整理",
+                lambda item: self._safe(lambda: self._set_input_mode("refine")),
+                checked=lambda item: self._mode_checked("refine"),
+                enabled=lambda item: self._refine_available(),
             ),
             pystray.MenuItem("退出", lambda: self._safe(self._on_quit)),
         )
@@ -93,27 +98,27 @@ class Tray:
         except Exception:
             pass
 
-    def _refine_checked(self):
-        """菜单勾选状态：润色开启时打勾。"""
+    def _mode_checked(self, mode):
+        """菜单状态：输入模式始终互斥。"""
         try:
             from config import get_config
-            return bool(get_config().get("refine_enabled", True))
+            return get_config().get("input_mode", "direct") == mode
         except Exception:
-            return True
+            return mode == "direct"
 
-    def _refine_enabled(self):
-        """菜单项可用性：未配置润色 API Key 时置灰不可用。"""
+    def _refine_available(self):
+        """智能整理依赖 API Key；快速输入始终可用。"""
         try:
             from config import get_config
             return bool(get_config().get("api_key"))
         except Exception:
             return False
 
-    def _toggle_refine(self):
-        """翻转润色开关并持久化；由 main 注入的回调负责改 config + save。"""
+    def _set_input_mode(self, mode):
+        """设置输入模式并刷新互斥菜单。"""
         try:
-            if self._on_toggle_refine:
-                self._on_toggle_refine()
+            if self._on_set_input_mode:
+                self._on_set_input_mode(mode)
         except Exception:
             pass
         # 刷新菜单勾选状态（pystray 在下次打开菜单时也会重读，但主动更新更即时）

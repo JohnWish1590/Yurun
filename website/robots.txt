@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://johnwish1590.github.io/Yurun/sitemap.xml

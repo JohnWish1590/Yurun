@@ -1,11 +1,11 @@
 # 官网媒体素材
 
-`yurun-demo.gif` 是官网当前使用的真实演示素材，由产品截图合成。后续可用新的录屏文件替换同名文件。
+`yurun-product-demo.mp4` 是官网当前使用的产品演示视频，由真实截图剪辑而成。后续可用新的录屏文件替换同名文件。
 
 建议文件名与用途：
 
-- `yurun-demo.gif`：15–25 秒的主产品演示，展示在 ChatGPT、Codex 或 Cursor 中「按住说话 → 实时浮窗 → 松开出字」。
+- `yurun-product-demo.mp4`：当前主产品演示，展示「模式选择 → 快速输入 → 实时识别 → 智能整理」。
 - `yurun-chatgpt.png`：ChatGPT 使用场景截图。
 - `yurun-codex.png`：Codex 或 Cursor 使用场景截图。
 
-录制前请隐藏 API Key、个人聊天内容、文件路径和通知；GIF 建议控制在 8 MB 内，以便移动网络加载。
+录制前请隐藏 API Key、个人聊天内容、文件路径和通知；视频应压缩后再发布，便于移动网络加载。

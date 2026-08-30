@@ -271,7 +271,7 @@ class SettingsWindow:
         # 先放右边的 spacer，把按钮推到右侧
         tk.Frame(btns, bg=BG).pack(side="left", expand=True, fill="x")
         PillButton(btns, "取消", self._on_close, primary=False, weight="normal").pack(side="right", padx=(BTN_GAP, 0))
-        PillButton(btns, "保存", self._save).pack(side="right")
+        PillButton(btns, "保存并应用", self._save, min_w=150).pack(side="right")
 
     def _make_card(self, parent):
         """白色卡片：Frame + 浅灰细边框（tkinter 无圆角 Frame，用直角矩形同样干净）。"""

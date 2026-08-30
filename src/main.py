@@ -8,6 +8,7 @@
 日志：%APPDATA%\\Yurun\\logs\\yurun.log
 """
 import ctypes
+from collections import deque
 import json
 import os
 import queue
@@ -25,6 +26,7 @@ _kernel32 = ctypes.windll.kernel32
 
 from config import get_config
 from hotkey import get_hotkey
+from voice_session import VoiceSession
 from logger import (
     get_logger,
     install_crash_handler,
@@ -58,6 +60,11 @@ class App:
         self._rec_thread = None
         self._paste_cb = None              # 等待粘贴的回调
         self._round_seq = 0                 # 每次按下热键 +1，用于作废过期的后台润色
+        # 每次语音拥有独立上下文。UI 只呈现最新一轮，旧轮次的迟到事件被安全丢弃，
+        # 绝不把旧句子送进新一轮目标窗口。
+        self._sessions = {}
+        self._active_session_id = None
+        self._recording_session_id = None
         # pynput 纠错热键状态（Ctrl+反引号）
         self._kb = None
         self._kb_listener = None
@@ -75,11 +82,11 @@ class App:
         self._partial_finish_id = None
         self._draining = False
         self._drain_interval = 30  # 删字节奏：每 30ms 删 1 字（打字 40ms/字，用户实测最满意的伴随节奏）
-        # 异步打字：缓冲区 + 单链 after 驱动（不阻塞 tk 主循环，浮窗动画才可见重绘）
-        self._type_buf = ""
+        # 异步打字：每句话拥有独立队列项。这样上一句尚在输出时开始下一句，
+        # 也不会把两句字符混进同一个缓冲区或错误目标窗口。
+        self._type_jobs = deque()
+        self._type_job = None
         self._typing = False
-        self._type_on_done = None
-        self._type_round_id = None
         self._type_interval_ms = 40
         # Phase 0：仅记录插入体验，复用既有 round_id，不改变 _round_seq 的生命周期。
         self._keyup_times = {}
@@ -134,6 +141,29 @@ class App:
         log.error("新旧热键均无法注册: new=%s old=%s", key_name, old_key)
         return False, "该按键无法注册，原热键也未能恢复；请重启语润。"
 
+    def _is_active_session(self, round_id):
+        """只有最新语音轮次可以更新浮窗或执行输入；None 是非会话 UI 事件。"""
+        return round_id is None or round_id == self._active_session_id
+
+    def _event_round_id(self, evt):
+        """提取会话事件携带的 round_id；兼容非会话 UI 事件。"""
+        kind = evt[0]
+        if kind in {"recording", "transcribing", "refining", "done", "stream_insert_done"}:
+            return evt[1] if len(evt) > 1 else None
+        if kind in {"error", "type_partial", "partial_preview"}:
+            return evt[2] if len(evt) > 2 else None
+        if kind == "paste":
+            return evt[3] if len(evt) > 3 else None
+        return None
+
+    def _focus_lock_hwnd(self):
+        """打字期间优先返回正在输出那一句自己的目标窗口。"""
+        if self._type_job is not None:
+            session = self._sessions.get(self._type_job["round_id"])
+            if session and session.target_hwnd:
+                return session.target_hwnd
+        return self._target_hwnd
+
     # ================= UI 事件泵 =================
     def pump(self):
         """主线程每 40ms：处理队列 + 驱动动画。"""
@@ -144,13 +174,14 @@ class App:
         except queue.Empty:
             pass
         # 焦点锁定：录音/输入期间若焦点被切走，抢回录音开始时的目标窗口
-        # （用户要"固定产生文字的框"——字必须打进开始录音时所在的输入框）
-        if self._target_hwnd and not self._quit:
+        # 使用每个会话记录的目标窗口，避免重叠语音时把上一句送到新目标。
+        focus_hwnd = self._focus_lock_hwnd()
+        if focus_hwnd and not self._quit:
             now = time.time()
             if now - self._last_steal > 0.4:
                 try:
-                    if _user32.GetForegroundWindow() != self._target_hwnd:
-                        if self._steal_focus(self._target_hwnd):
+                    if _user32.GetForegroundWindow() != focus_hwnd:
+                        if self._steal_focus(focus_hwnd):
                             self._last_steal = now
                 except Exception:
                     pass
@@ -161,6 +192,15 @@ class App:
     def _handle_ui(self, evt):
         kind = evt[0]
         try:
+            round_id = self._event_round_id(evt)
+            # 已完成的文字必须保留：旧会话的输入事件进入自己的队列并按其目标窗口输出；
+            # 只有旧会话的状态浮窗/错误提示不能覆盖正在进行的新一轮。
+            input_events = {"paste", "type_partial", "stream_insert_done"}
+            if (round_id is not None and kind not in input_events
+                    and not self._is_active_session(round_id)):
+                log.info("丢弃过期 UI 事件: kind=%s round_id=%s active=%s",
+                         kind, round_id, self._active_session_id)
+                return
             if kind == "guide":
                 self.indicator.show_guide("开始录音")
             elif kind == "recording":
@@ -174,15 +214,16 @@ class App:
             elif kind == "refining":
                 self.indicator.show_refining()
             elif kind in ("done", "fallback"):
-                # 完成：直接隐藏 + 粘贴，pill 不显示预览文字；释放焦点锁定
+                # 完成：只在文字已完整输入后进入很短的「已输入」收尾态；释放焦点锁定。
                 self._target_hwnd = None
-                self.indicator.set_anchor_hwnd(None)
                 self._hide_partial()
-                self.indicator.force_idle()
+                self.indicator.show_complete()
             elif kind == "error":
                 # 错误结束：释放焦点锁定
                 self._target_hwnd = None
                 self.indicator.set_anchor_hwnd(None)
+                self.indicator.set_uia_anchor_rect(None)
+                self.indicator.set_uia_caret_rect(None)
                 self._hide_partial()
                 self.indicator.show_error(evt[1] if len(evt) > 1 else "出错了")
             elif kind == "toast":
@@ -345,36 +386,70 @@ class App:
     def _on_hold_start(self, _key):
         log.info("热键按下，开始录音")
         # 焦点锁定（C1）：记录开始时的目标输入控件；录音/输入期间焦点被切走会抢回
-        self._target_hwnd = self._get_target_hwnd()
+        target_hwnd = self._get_target_hwnd()
+        self._target_hwnd = target_hwnd
         log.info("锁定目标窗口 hwnd=%s", self._target_hwnd)
         # 只用于 pill / Partial 浮窗定位，避免 Tk 窗口短暂成为前台时退回屏幕左上角。
         self.indicator.set_anchor_hwnd(self._target_hwnd)
+        # 只读一次 UIA：优先取系统提供的真实插入点；不支持时保留控件边界作为下一层回退。
+        # 两者都只读属性，不会激活窗口、点击或读取用户输入的文字。
+        try:
+            from pill import capture_uia_caret_rect, capture_uia_focused_rect
+            self.indicator.set_uia_caret_rect(capture_uia_caret_rect(self._target_hwnd))
+            self.indicator.set_uia_anchor_rect(capture_uia_focused_rect(self._target_hwnd))
+        except Exception as exc:
+            log.debug("UIA 锚点读取跳过: %r", exc)
+            self.indicator.set_uia_caret_rect(None)
+            self.indicator.set_uia_anchor_rect(None)
         # 不再拦截"已有录音进行中"：允许前一句还在识别/润色时按下热键录下一句
         # （重叠录音）。hold 模式物理上同一键按住中不会再触发 WM_HOTKEY，
         # 所以这里每次按下都是独立的一次录音，配独立临时文件互不干扰。
-        stop = threading.Event()
-        self._rec_stop = stop
-        cfg = get_config()
+        self._round_seq += 1
+        round_id = self._round_seq
+        # 配置在按下时冻结：中途改设置不会改变这一句的识别/润色请求。
+        cfg = dict(get_config().data)
+        session = VoiceSession(
+            round_id=round_id,
+            target_hwnd=target_hwnd,
+            stop_event=threading.Event(),
+            config=cfg,
+        )
+        self._sessions[round_id] = session
+        self._active_session_id = round_id
+        self._recording_session_id = round_id
+        self._rec_stop = session.stop_event
+        # 单独记录会话生命线，不写转写内容、窗口标题或 API 信息。
+        # 插入 KPI 只能从 insert_start 开始；这份轨迹能定位“录到了、却还没进输入”的丢失。
+        self._trace_session(round_id, "hold_start", target_captured=bool(target_hwnd))
+        log.info("语音会话创建: round_id=%s target_hwnd=%s", round_id, target_hwnd)
         if cfg.get("asr_provider") == "sauc":
             # 真流式：边录边发（ws race 已在 sauc_asr 内修好，单线程发完再收）
             self._rec_thread = threading.Thread(
-                target=self._record_job_sauc, args=(stop, cfg), daemon=True)
+                target=self._record_job_sauc, args=(session,), daemon=True)
         else:
             # 云端 HTTP / 本地 Whisper：仍需整段 wav
             self._rec_thread = threading.Thread(
-                target=self._record_job, args=(stop,), daemon=True)
-        self._round_seq += 1
+                target=self._record_job, args=(session,), daemon=True)
+        # 先投递录音态，再启动可能极快的 SAUC 工作线程。
+        # 否则首次冷启动时，工作线程会抢先投递“正在识别”，覆盖“正在录音”。
+        self.ui_q.put(("recording", round_id))
         self._rec_thread.start()
-        self.ui_q.put(("recording", None))
 
     def _on_hold_end(self, _key):
         log.info("热键松开，停止录音")
-        if self._rec_stop is not None:
-            round_id = self._round_seq
-            self._keyup_times[round_id] = time.perf_counter()
+        session = self._sessions.get(self._recording_session_id)
+        if session is not None and self._rec_stop is not None:
+            round_id = session.round_id
+            self._keyup_times[round_id] = session.mark_keyup()
+            self._trace_session(round_id, "keyup")
             log.info("insert_metric round_id=%s event=keyup", round_id)
-            self._rec_stop.set()
+            # SAUC 流式线程从按下即启动，因此“正在识别”必须在松开时才切换；
+            # 非 SAUC 分支会在录音文件写完后自行投递该状态。
+            if session.config.get("asr_provider") == "sauc":
+                self.ui_q.put(("transcribing", round_id))
+            session.stop_event.set()
             self._rec_stop = None
+            self._recording_session_id = None
 
     def _on_toggle(self, _key, pressed):
         if pressed:
@@ -433,7 +508,7 @@ class App:
             return False
         backup = self._clipboard_backup()
         try:
-            # 这是纠正操作本身的必要聚焦，不属于录音/输入流程的焦点策略。
+            # 这是纠正操作本身的必要聚焦，不属于录音/插入流程的焦点策略。
             if _user32.GetForegroundWindow() != target_hwnd:
                 self._steal_focus(target_hwnd)
             self.root.clipboard_clear()
@@ -606,8 +681,8 @@ class App:
                 return
             try:
                 entry = add_entry(correct, wrong, source="auto")
-                log.info("词库新增: correct=%r wrong=%r count=%s",
-                         correct, wrong, entry.get("count"))
+                log.info("词库新增: correct_length=%s wrong_length=%s count=%s",
+                         len(correct), len(wrong), entry.get("count"))
             except Exception as ex:
                 log.error("存入词库失败: %s", ex)
                 status_var.set("存入失败")
@@ -619,10 +694,12 @@ class App:
                 replaced = self._replace_correction_selection(correct, selection_hwnd)
             if replaced:
                 status_var.set(f"已替换并存入词库：{correct}")
-                log.info("纠正已替换当前选区: wrong=%r correct=%r", wrong, correct)
+                log.info("纠正已替换当前选区: wrong_length=%s correct_length=%s",
+                         len(wrong), len(correct))
             elif selected_text:
                 status_var.set(f"已存入词库（当前文字未替换）：{correct}")
-                log.warning("纠正仅存词库，当前选区替换失败: wrong=%r correct=%r", wrong, correct)
+                log.warning("纠正仅存词库，当前选区替换失败: wrong_length=%s correct_length=%s",
+                            len(wrong), len(correct))
             else:
                 status_var.set(f"已存入词库：{correct}")
             win.after(1200, win.destroy)
@@ -670,8 +747,9 @@ class App:
         win.lift()
 
     # ================= 录音→转写→润色→粘贴 =================
-    def _record_job(self, stop):
-        cfg = get_config()
+    def _record_job(self, session):
+        """非 SAUC 录音任务；只使用本会话冻结的配置与轮次。"""
+        cfg = session.config
         # 统一路径：先录 wav 文件，再调 _transcribe 转写。
         # sauc/cloud/local 都走这条（_transcribe 内部按 provider 分派），
         # 避免真流式双线程 ws race 导致 indicator 卡死。
@@ -684,30 +762,34 @@ class App:
             from recorder import record_to_file
             log.info("录音开始 provider=%s tmp=%s", cfg.get("asr_provider", "sauc"), tmp_wav)
             ok, dur, err = record_to_file(
-                tmp_wav, stop_event=stop,
+                tmp_wav, stop_event=session.stop_event,
                 max_seconds=90, silence_timeout=0.0,
                 on_level=self._on_level,
             )
             if not ok or dur < 0.3:
+                self._trace_session(session.round_id, "recording_invalid")
                 log.warning("录音无效: ok=%s dur=%.2f err=%s", ok, dur, err)
-                self.ui_q.put(("error", "识别失败"))
+                self.ui_q.put(("error", "识别失败", session.round_id))
                 return
             log.info("录音完成: %.2fs", dur)
 
-            self.ui_q.put(("transcribing", None))
+            self.ui_q.put(("transcribing", session.round_id))
             try:
                 log.info("进入 _transcribe provider=%s wav=%s", cfg.get("asr_provider", "sauc"), tmp_wav)
                 t_asr0 = time.time()
                 text = self._transcribe(tmp_wav, cfg)
-                log.info("_transcribe 返回 text=%r 识别耗时=%.2fs", text, time.time() - t_asr0)
+                log.info("_transcribe 返回 text_length=%s 识别耗时=%.2fs",
+                         len(text or ""), time.time() - t_asr0)
             except Exception as e:
+                self._trace_session(session.round_id, "asr_error")
                 log.error("识别失败: %s", e)
-                self.ui_q.put(("error", "识别失败"))
+                self.ui_q.put(("error", "识别失败", session.round_id))
                 return
-            self._after_transcribe(text, round_id=self._round_seq)
+            self._after_transcribe(text, round_id=session.round_id)
         except Exception as e:
+            self._trace_session(session.round_id, "recording_error")
             log.error("录音异常: %s", e)
-            self.ui_q.put(("error", "录音失败"))
+            self.ui_q.put(("error", "录音失败", session.round_id))
             return
         finally:
             try:
@@ -719,43 +801,44 @@ class App:
     # 原"双线程 ws race"已通过在 sauc_transcribe_stream 内改为单线程
     # "边录边发→发完再收"规避（见 sauc_asr.py），现由 _on_hold_start 在 sauc 模式下启用。
 
-    def _record_job_sauc(self, stop, cfg):
+    def _record_job_sauc(self, session):
         """SAUC 真流式分支：录音生成器边产出 PCM 边发往 WebSocket，并发收结果。"""
+        cfg = session.config
         try:
             from recorder import record_chunks
             from sauc_asr import sauc_transcribe_stream
             from dictionary import to_hotwords
         except Exception as e:
             log.error("导入 SAUC 流式模块失败: %s", e)
-            self.ui_q.put(("error", "模块失败"))
+            self.ui_q.put(("error", "模块失败", session.round_id))
             return
-        round_id = self._round_seq
-        self.ui_q.put(("transcribing", None))
+        round_id = session.round_id
         try:
             # Phase 1：Partial 经 UI 队列打到测试浮窗（不碰 SendInput 主路径）。
             # Phase 0：on_timeline 收集 T0-T7 时间戳，待识别结束打印耗时分解。
-            self._timeline = {}
+            session.timeline.clear()
             text = sauc_transcribe_stream(
-                record_chunks(stop, on_level=self._on_level, max_seconds=90),
+                record_chunks(session.stop_event, on_level=self._on_level, max_seconds=90),
                 api_key=cfg.get("asr_sauc_key"),
                 resource_id=cfg.get("asr_sauc_resource_id"),
                 endpoint=cfg.get("asr_sauc_endpoint"),
                 language=cfg.get("language", "auto"),
                 proxy=cfg.get("proxy", ""),
                 hotwords=to_hotwords(),
-                on_partial=lambda t: self.ui_q.put(("partial_preview", t)),
-                on_timeline=lambda m, t: self._timeline.__setitem__(m, t),
+                on_partial=lambda t: self.ui_q.put(("partial_preview", t, round_id)),
+                on_timeline=lambda m, t: session.timeline.__setitem__(m, t),
             )
-            self._log_timeline()
+            self._log_timeline(session.timeline, round_id)
         except Exception as e:
+            self._trace_session(session.round_id, "sauc_error")
             log.error("识别失败: %s", e)
-            self.ui_q.put(("error", "识别失败"))
+            self.ui_q.put(("error", "识别失败", round_id))
             return
         self._after_transcribe(text, round_id=round_id)
 
-    def _log_timeline(self):
+    def _log_timeline(self, timeline, round_id):
         """Phase 0：打印 SAUC 识别 T0-T7 时间戳分解（相对 T0 的毫秒）。"""
-        m = getattr(self, "_timeline", None) or {}
+        m = timeline or {}
         if "T0" not in m:
             return
         t0 = m["T0"]
@@ -764,8 +847,8 @@ class App:
         def span(a, b):
             return (m[b] - m[a]) * 1000.0 if (a in m and b in m) else float("nan")
         log.info(
-            "SAUC 时间戳(相对T0, ms): T1=%.0f T2=%.0f T3=%.0f T4=%.0f T5=%.0f T6=%.0f T7=%.0f",
-            rel("T1"), rel("T2"), rel("T3"), rel("T4"), rel("T5"), rel("T6"), rel("T7"),
+            "SAUC 时间戳 round_id=%s (相对T0, ms): T1=%.0f T2=%.0f T3=%.0f T4=%.0f T5=%.0f T6=%.0f T7=%.0f",
+            round_id, rel("T1"), rel("T2"), rel("T3"), rel("T4"), rel("T5"), rel("T6"), rel("T7"),
         )
         log.info(
             "SAUC 派生: 首字延迟(T0→T3)=%.0fms 松手→Final(T5→T6)=%.0fms 纯收尾(T4→T6)=%.0fms",
@@ -780,14 +863,24 @@ class App:
             w = tk.Toplevel(self.root)
             w.overrideredirect(True)          # 无标题栏，避免抢焦点
             w.attributes("-topmost", True)    # 置顶但不抢输入焦点
-            w.attributes("-alpha", 0.92)
-            w.configure(bg="#1e1e2e")
-            lbl = tk.Label(
-                w, text="", bg="#1e1e2e", fg="#a6e3a1",
-                font=("Microsoft YaHei UI", 15),
-                padx=12, pady=8, wraplength=560, justify="left", anchor="w",
+            # 临时识别文字是“正在流入输入框”的预览，不应像终端日志一样发绿发小。
+            # 用更深、更稳的底色承托 17px 近白微绿字；绿色只留给前导输入竖线。
+            w.attributes("-alpha", 0.96)
+            w.configure(bg="#1b1c24")
+            inner = tk.Frame(w, bg="#1b1c24", padx=12, pady=8)
+            inner.pack()
+            # 输入竖线独立成一个控件，才能只给它绿色；正文不再整段发绿。
+            bar = tk.Label(
+                inner, text="▌", bg="#1b1c24", fg="#7EE787",
+                font=("Microsoft YaHei UI", 17), anchor="n",
             )
-            lbl.pack()
+            bar.pack(side="left", anchor="n", padx=(0, 7))
+            lbl = tk.Label(
+                inner, text="", bg="#1b1c24", fg="#E5F3E8",
+                font=("Microsoft YaHei UI", 17),
+                wraplength=535, justify="left", anchor="w",
+            )
+            lbl.pack(side="left", anchor="w")
             w.geometry("+%d+%d" % (40, 40))
             w.withdraw()
             self._partial_win = w
@@ -808,28 +901,34 @@ class App:
         if self._partial_win is None:
             return
         try:
-            self._partial_lbl.configure(text="▌ " + (text or ""))
+            # 只有输入竖线保留绿色，正文保持高对比的近白微绿，阅读更轻松。
+            self._partial_lbl.configure(text=(text or ""), fg="#E5F3E8")
             self._partial_win.deiconify()
             self._partial_win.update_idletasks()  # 让 geometry 尺寸先算出来再定位
             pw = self._partial_win.winfo_width()
             ph = self._partial_win.winfo_height()
-            scr_w = _user32.GetSystemMetrics(0)
-
             # 方案2修正：优先贴在语润自己的 indicator（正在录音/润色气泡）正上方。
             # 定位改为「钉左缘」：浮窗左缘固定对齐 indicator 左缘，文字只往右/往下长，
             # 不再随字数变化而左右两边同时扩大 —— 根除录音阶段浮窗「向两边胀」的跳动感。
             p = self.indicator.get_rect() if self.indicator else None
             if p:
                 px, py, pill_w, pill_h = p
+                from pill import work_area_for_rect
+                wl, wt, wr, wb = work_area_for_rect((px, py, px + pill_w, py + pill_h))
                 LEFT_OFFSET = 0
                 max_w = 560 + 24  # wraplength(560) + 左右 padding(12*2)，用于超右屏的一次性钳制
                 x = px + LEFT_OFFSET
-                if x + max_w > scr_w - 4:
-                    x = scr_w - max_w - 4  # 超右屏则整体左移（一次性，不随字数跳）
-                x = max(4, x)
+                # 边界按 pill 所在那块屏幕的工作区计算；副屏在左侧时 x 可以为负数。
+                usable_w = max(1, wr - wl - 8)
+                span_w = min(max_w, usable_w)
+                if x + span_w > wr - 4:
+                    x = wr - span_w - 4  # 超右边缘则整体左移（一次性，不随字数跳）
+                x = max(wl + 4, x)
                 y = py - ph - 8
-                if y < 4:
+                if y < wt + 4:
                     y = py + pill_h + 8  # indicator 贴屏顶时改放其正下方
+                if y + ph > wb - 4:
+                    y = max(wt + 4, wb - ph - 4)
                 self._partial_win.geometry("+%d+%d" % (x, y))
                 return
 
@@ -839,12 +938,17 @@ class App:
                 import ctypes.wintypes as _wt
                 rect = _wt.RECT()
                 if _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    from pill import work_area_for_rect
+                    wl, wt, wr, wb = work_area_for_rect(
+                        (rect.left, rect.top, rect.right, rect.bottom))
                     win_w = rect.right - rect.left
                     x = rect.left + max(0, (win_w - pw) // 2)
-                    x = max(4, min(x, scr_w - pw - 4))
+                    x = max(wl + 4, min(x, wr - pw - 4))
                     y = rect.top - ph - 12
-                    if y < 4:
+                    if y < wt + 4:
                         y = rect.top + 24
+                    if y + ph > wb - 4:
+                        y = max(wt + 4, wb - ph - 4)
                     self._partial_win.geometry("+%d+%d" % (x, y))
         except Exception:
             pass
@@ -913,10 +1017,12 @@ class App:
         「正在润色」并等待后台结果；其余情况（太短跳过 / 未配置 / 模型大概率
         返回 no_change）直接收尾隐藏，避免图标空挂 5s 的误导观感。
         """
-        log.info("识别结果: %s", text)
+        log.info("识别结果: text_length=%s", len(text or ""))
         if not text or not text.strip():
-            self.ui_q.put(("error", "没识别到"))
+            self._trace_session(round_id, "asr_empty")
+            self.ui_q.put(("error", "没识别到", round_id))
             return
+        self._trace_session(round_id, "asr_final", text_length=len(text))
 
         # ASR（火山 SAUC）自带标点预测，纯数字/手机号/订单号常被补末尾句号
         # （如「12345。」）。数字为主的文本先剥掉末尾标点再进润色/bypass 决策，
@@ -934,14 +1040,14 @@ class App:
         if self._input_mode() == "direct":
             from refiner import light_clean
             final = light_clean(text)
-            log.info("轻清洗直出: %s", final)
+            log.info("轻清洗直出: text_length=%s", len(final or ""))
             self.ui_q.put(("paste", final, True, round_id))
             return
 
         if self._refine_will_change(text):
             # 方案B：不先贴原文，显示「正在润色」并后台润色，完成后一次性贴最终文本。
             # 无 replace 步骤 → 从根上避免误删/误覆盖输入框里之前的内容。
-            self.ui_q.put(("refining", None))
+            self.ui_q.put(("refining", round_id))
             threading.Thread(
                 target=self._refine_and_paste, args=(text, round_id), daemon=True
             ).start()
@@ -972,11 +1078,8 @@ class App:
         优先走流式（边润边贴，首字即上屏）；流式关闭或非 type 插入时回退整段 refine_text。
         无 replace 步骤。
         """
-        # 若已有更新的录音轮次，旧润色作废，避免回插覆盖新内容。
-        if round_id is not None and round_id != self._round_seq:
-            log.info("润色轮次过期（已有新录音），跳过粘贴")
-            self.ui_q.put(("done", text))
-            return
+        # 已经录下的话必须完成。即使之后开始了新一轮，也只把本句排进自己的
+        # 输入队列项；由队列按会话目标窗口输出，旧浮窗不会覆盖新浮窗。
         cfg = get_config()
         use_stream = cfg.get("refine_streaming", True) and (cfg.get("insert_method") or "type") == "type"
         if use_stream:
@@ -1003,9 +1106,7 @@ class App:
             self._insert_metrics.setdefault(round_id, {"text_length": 0, "streaming": True})
 
         def on_delta(seg):
-            # 过期则不再投递新分片（已贴部分保留，但不继续覆盖新内容）
-            if round_id is not None and round_id != self._round_seq:
-                return
+            # 每个分片带自己的 round_id；UI 不显示旧浮窗，但输入队列不能丢句。
             self.ui_q.put(("type_partial", seg, round_id))
 
         try:
@@ -1027,9 +1128,8 @@ class App:
         log.info("流式润色耗时=%.2fs ok=%s reason=%s", time.time() - t_rf0, result["ok"], result.get("reason"))
 
         if result["ok"]:
-            # 等最后一个流式分片真正投递完，再记录 insert_done 并收尾。
+            # 等最后一个流式分片真正投递完，再记录 insert_done 并进入收尾态。
             self.ui_q.put(("stream_insert_done", round_id))
-            self.ui_q.put(("done", text))
         else:
             if round_id is not None:
                 self._streaming_rounds.discard(round_id)
@@ -1155,6 +1255,27 @@ class App:
         log.info("insert_metric round_id=%s mode=%s text_length=%s event=insert_done ttci_ms=%.0f",
                  round_id, self._input_mode(), metric.get("text_length", 0), ttci_ms)
         self._write_insert_metric("insert_done", round_id, metric, ttci_ms=ttci_ms)
+        self._trace_session(round_id, "input_done", text_length=metric.get("text_length", 0))
+
+    def _trace_session(self, round_id, event, **facts):
+        """把一次语音的关键交接点写入独立、脱敏的诊断轨迹。
+
+        这里绝不写语音原文、窗口标题、句柄、剪贴板或密钥；仅保存轮次、时间、事件
+        和文本长度。它不参与 TTFI/TTCI 统计，避免污染已有性能基线。
+        """
+        if round_id is None:
+            return
+        record = {
+            "timestamp_ms": int(time.time() * 1000),
+            "round_id": round_id,
+            "event": event,
+        }
+        record.update(facts)
+        try:
+            with (logs_dir() / "session-trace.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            log.warning("会话轨迹落盘失败: %s", exc)
 
     def _write_insert_metric(self, event, round_id, metric, **durations):
         """KPI 专用脱敏落盘：不依赖通用日志，绝不保存转写文本。"""
@@ -1173,14 +1294,17 @@ class App:
             log.warning("插入指标落盘失败: %s", exc)
 
     def _complete_stream_insert(self, round_id):
-        """流式润色结束信号：等待缓冲区清空后才算完整输入。"""
+        """流式润色结束信号：等待缓冲区清空后才算完整输入，再触发浮窗收尾。"""
         if round_id is None:
             return
         self._stream_complete_rounds.add(round_id)
-        if not self._typing and not self._type_buf:
+        queued_for_round = any(job["round_id"] == round_id for job in self._type_jobs)
+        current_for_round = self._type_job and self._type_job["round_id"] == round_id
+        if not self._typing and not queued_for_round and not current_for_round:
             self._record_insert_done(round_id)
             self._streaming_rounds.discard(round_id)
             self._stream_complete_rounds.discard(round_id)
+            self.ui_q.put(("done", round_id))
 
     def _do_type(self, text, round_id=None):
         """主线程：SendInput 逐字输入一段文本（流式分片），不隐藏 pill、不发 done。
@@ -1190,12 +1314,6 @@ class App:
         on_each 把"浮窗从开头删一字"绑进打字循环，使吸走动画与打字严格同步（开头对齐）。
         """
         try:
-            from typer import type_text
-            # ③ 切窗口兜底：每段打字前把焦点抢回录音时锁定的原窗口。
-            # pump 的焦点锁在 _do_type 同步阻塞期间不运行，必须在投字前主动抢回，
-            # 否则用户在润色阶段切走，SendInput 会把字投进新窗口。
-            if self._target_hwnd and _user32.GetForegroundWindow() != self._target_hwnd:
-                self._steal_focus(self._target_hwnd)
             # 异步打字链由 tk 主循环驱动：逐字打字的同时，独立的慢速删字定时器
             # （_start_drain → _drain_timer_step）从浮窗开头逐字吸走，明显慢于打字。
             # 这里绝不能再 withdraw 浮窗，否则第一段 chunk enqueue 完就 withdraw，浮窗会"一下全没"。
@@ -1208,58 +1326,108 @@ class App:
             log.warning("流式 SendInput 输入失败: %s", e)
 
     def _enqueue_type(self, text, on_done=None, round_id=None):
-        """把文本追加到打字缓冲区并启动异步打字链（单链，避免多段并发错序）。"""
-        # ③ 切窗口兜底：打字前把焦点抢回录音时锁定的原窗口
-        if self._target_hwnd and _user32.GetForegroundWindow() != self._target_hwnd:
-            self._steal_focus(self._target_hwnd)
+        """把文本放入所属会话的打字队列，单链输出但绝不混句。"""
+        if not text:
+            if on_done:
+                self.root.after(0, on_done)
+            return
         self._record_insert_start(round_id, text)
-        self._type_buf += text
-        if round_id is not None:
-            self._type_round_id = round_id
         interval_ms = self._animation_interval_ms(len(text or ""))
-        if interval_ms:
-            self._type_interval_ms = interval_ms
-            self._drain_interval = max(8, int(interval_ms * 0.75))
-        if on_done is not None:
-            self._type_on_done = on_done
+        interval_ms = interval_ms or self._type_interval_ms
+        # 同一流式润色会话的 delta 追加到自己的末尾；不同会话则独立排队。
+        if self._type_job is not None and self._type_job["round_id"] == round_id:
+            self._type_job["buffer"] += text
+            self._type_job["interval_ms"] = interval_ms
+            if on_done is not None:
+                self._type_job["on_done"] = on_done
+        elif self._type_jobs and self._type_jobs[-1]["round_id"] == round_id:
+            job = self._type_jobs[-1]
+            job["buffer"] += text
+            job["interval_ms"] = interval_ms
+            if on_done is not None:
+                job["on_done"] = on_done
+        else:
+            self._type_jobs.append({
+                "round_id": round_id,
+                "buffer": text,
+                "interval_ms": interval_ms,
+                "on_done": on_done,
+            })
         if not self._typing:
             self._typing = True
             self.root.after(0, self._type_step)
             # 打字一开始即启动慢速删字（开头对齐打字），与打字解耦、明显慢于打字
             self._start_drain()
 
+    def _abort_type_job(self, job, reason):
+        """停止一个无法确认完整投递的会话，绝不自动重试同一字符。"""
+        round_id = job["round_id"]
+        self._trace_session(round_id, "input_failed")
+        log.error("SendInput 输入中止: round_id=%s reason=%s", round_id, reason)
+        self._type_jobs = deque(
+            pending for pending in self._type_jobs if pending["round_id"] != round_id)
+        self._streaming_rounds.discard(round_id)
+        self._stream_complete_rounds.discard(round_id)
+        self._type_job = None
+        self.ui_q.put(("error", "输入失败", round_id))
+        self.root.after(0, self._type_step)
+
     def _type_step(self):
-        if not self._type_buf:
-            self._typing = False
-            round_id = self._type_round_id
+        if self._type_job is None:
+            if not self._type_jobs:
+                self._typing = False
+                return
+            self._type_job = self._type_jobs.popleft()
+            self._type_interval_ms = self._type_job["interval_ms"]
+            self._drain_interval = max(8, int(self._type_interval_ms * 0.75))
+
+        job = self._type_job
+        if not job["buffer"]:
+            round_id = job["round_id"]
             if round_id in self._stream_complete_rounds:
                 self._record_insert_done(round_id)
                 self._streaming_rounds.discard(round_id)
                 self._stream_complete_rounds.discard(round_id)
+                self.ui_q.put(("done", round_id))
             elif round_id not in self._streaming_rounds:
                 self._record_insert_done(round_id)
-            self._type_round_id = None
-            cb = self._type_on_done
-            self._type_on_done = None
-            self._finish_partial_drain()
+            cb = job["on_done"]
+            self._type_job = None
+            # 浮窗只属于最新会话；旧会话收尾不能隐藏正在录制的新一轮浮窗。
+            if self._is_active_session(round_id):
+                self._finish_partial_drain()
             if cb:
                 try:
                     cb()
                 except Exception:
                     pass
+            self.root.after(0, self._type_step)
             return
-        ch = self._type_buf[0]
-        self._type_buf = self._type_buf[1:]
+
+        ch = job["buffer"][0]
+        job["buffer"] = job["buffer"][1:]
         try:
             from typer import type_text
+            session = self._sessions.get(job["round_id"])
+            target_hwnd = session.target_hwnd if session else None
+            # 每个队列项只回到自己录音开始时的目标窗口，不能借用最新一轮的全局目标。
+            if target_hwnd and _user32.GetForegroundWindow() != target_hwnd:
+                self._steal_focus(target_hwnd)
             sent = type_text(ch)
             if sent >= 2:
-                self._record_first_insert(self._type_round_id)
+                self._record_first_insert(job["round_id"])
+            else:
+                # 一个 Unicode 字需要 key-down + key-up 两个事件。少于两个就不能确认
+                # 该字已完整进入目标程序；此时绝不自动重试，避免重复字或半个代理对。
+                self._abort_type_job(job, f"sent={sent}")
+                return
         except Exception as e:
             log.warning("逐字 SendInput 失败: %s", e)
+            self._abort_type_job(job, "exception")
+            return
         # 删字不再绑定打字步（那样会和打字同速，显得"一下没"）；
         # 改由独立的慢速定时器（_drain_timer_step）驱动，明显慢于打字，逐字吸走可见。
-        self.root.after(self._type_interval_ms, self._type_step)
+        self.root.after(job["interval_ms"], self._type_step)
 
     def _do_paste(self, text, hide=True, replace=False, round_id=None):
         """主线程：把 text 送进当前焦点窗口。
@@ -1282,9 +1450,10 @@ class App:
                 # 走统一的异步打字链（_enqueue_type 已含抢焦点），由 tk 主循环驱动，
                 # 保证浮窗逐字吸走动画可见；done 由 on_done 在打字完成后发出
                 log.info("SendInput（type 模式，异步，零剪贴板污染）")
+                self._trace_session(round_id, "input_enqueued", text_length=len(text or ""))
                 self._enqueue_type(
                     text,
-                    on_done=(lambda: self.ui_q.put(("done", text))) if hide else None,
+                    on_done=(lambda: self.ui_q.put(("done", round_id))) if hide else None,
                     round_id=round_id,
                 )
                 return
@@ -1293,10 +1462,13 @@ class App:
                 # 落到下面的 paste 路径作兜底
 
         # paste 路径（兜底或用户显式选择）：写剪贴板 + Ctrl+V
+        self._trace_session(round_id, "input_enqueued", text_length=len(text or ""), method="paste")
         self._record_insert_start(round_id, text)
-        # ③ 切窗口兜底：粘贴前抢回焦点，字进原窗口
-        if self._target_hwnd and _user32.GetForegroundWindow() != self._target_hwnd:
-            self._steal_focus(self._target_hwnd)
+        # ③ 切窗口兜底：粘贴前回到本会话录音开始时的目标窗口，不能借用最新一轮。
+        session = self._sessions.get(round_id)
+        target_hwnd = session.target_hwnd if session else self._target_hwnd
+        if target_hwnd and _user32.GetForegroundWindow() != target_hwnd:
+            self._steal_focus(target_hwnd)
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
@@ -1320,7 +1492,7 @@ class App:
             # 浮窗收尾（若有剩字），再发 done（done 不会打断收尾）
             pass  # 收尾交给异步打字链（_enqueue_type → _type_step → _finish_partial_drain）
             if hide:
-                self.ui_q.put(("done", text))
+                self.ui_q.put(("done", round_id))
         except Exception as e:
             log.warning("pyautogui 失败: %s", e)
             try:
@@ -1331,10 +1503,10 @@ class App:
                     "[System.Windows.Forms.SendKeys]::SendWait('" + ks + "')"])
                 self._record_first_insert(round_id)
                 self._record_insert_done(round_id)
-                self.ui_q.put(("done", text))
+                self.ui_q.put(("done", round_id))
             except Exception as e2:
                 log.error("备用粘贴失败: %s", e2)
-                self.ui_q.put(("error", "粘贴失败"))
+                self.ui_q.put(("error", "粘贴失败", round_id))
 
     # ================= 托盘 =================
     def _on_quit(self):
@@ -1403,11 +1575,11 @@ class App:
             log.warning("预热部分依赖失败，将在首次使用时按需加载: %s", e)
 
     def run(self):
-        # 单实例锁：杀掉旧实例并接管，保证永远只有一个进程(也防僵尸占热键)
+        # 正式版仅接管自己的旧实例，避免旧进程占用热键。
         try:
             from singleinstance import kill_old_and_takeover, kill_other_yurun_exe
-            kill_old_and_takeover()   # PID 文件法：覆盖 dev 模式 + 已知旧 PID
-            kill_other_yurun_exe()     # 进程名枚举法：兜底清理无 PID 文件的旧 exe 僵尸
+            kill_old_and_takeover()
+            kill_other_yurun_exe()
         except Exception as e:
             log.warning("单实例检查失败: %s", e)
         log.info("语润启动（开发版）")

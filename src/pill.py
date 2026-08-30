@@ -4,7 +4,7 @@
 - 跟随当前活动输入框的「I 形光标」，浮在它正下方 GAP，且水平中线相对 caret.x 偏移 OFFSET_X（设计 C：飘落感）。
 - caret 靠近任务栏/屏底时自动翻到光标上方（兑底），避免被遮。
 - 智能跟背景：采样光标上方像素亮度，亮底用浅色 pill+深字，暗底用深色 pill+浅字。
-- 录音中显示「正在录音」，润色中显示「正在润色」；完成/兜底后立即隐藏（不显示预览）。
+- 录音中显示「正在录音」，识别/润色时显示连续转圈；文字完整输入后短暂显示「已输入」并柔和淡出。
 - 五态 + 引导态，状态严格轮转，主线程 after 驱动动画，绝不卡死。
 - 任何活动态超时就强制报错退出（心跳兜底）。
 - 所有方法必须在 Tk 主线程调用（由 main 的 after 循环驱动 _tick）。
@@ -57,6 +57,11 @@ _gdi32 = ctypes.windll.gdi32
 _gdi32.GetPixel.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_int]
 _gdi32.GetPixel.restype = wintypes.COLORREF
 
+# 多显示器坐标可以为负数，且各屏的任务栏/缩放不同；不可再把主屏 (0, 0) 当作边界。
+SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+MONITOR_DEFAULTTONEAREST = 2
+
 
 class _GUITHREADINFO(ctypes.Structure):
     _fields_ = [
@@ -70,6 +75,57 @@ class _GUITHREADINFO(ctypes.Structure):
         ("hwndCaret", wintypes.HWND),
         ("rcCaret", wintypes.RECT),
     ]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+try:
+    _user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+    _user32.MonitorFromPoint.restype = wintypes.HMONITOR
+    _user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(_MONITORINFO)]
+    _user32.GetMonitorInfoW.restype = wintypes.BOOL
+except Exception:
+    pass
+
+
+def _virtual_desktop_rect():
+    """返回所有显示器组成的虚拟桌面边界，兼容左侧/上侧副屏的负坐标。"""
+    l = _user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    t = _user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    w = _user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    h = _user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    if w <= 0 or h <= 0:
+        w, h = _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1)
+        l, t = 0, 0
+    return l, t, l + w, t + h
+
+
+def work_area_for_rect(rect=None):
+    """取一个矩形所在显示器的可用工作区（自动扣除该屏任务栏）。"""
+    vl, vt, vr, vb = _virtual_desktop_rect()
+    if rect:
+        x = (rect[0] + rect[2]) // 2
+        y = (rect[1] + rect[3]) // 2
+    else:
+        x, y = (vl + vr) // 2, (vt + vb) // 2
+    try:
+        monitor = _user32.MonitorFromPoint(wintypes.POINT(x, y), MONITOR_DEFAULTTONEAREST)
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if monitor and _user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            rc = info.rcWork
+            if rc.right > rc.left and rc.bottom > rc.top:
+                return rc.left, rc.top, rc.right, rc.bottom
+    except Exception as exc:
+        _log.debug("显示器工作区读取失败，回退虚拟桌面: %r", exc)
+    return vl, vt, vr, vb
 
 
 def _cursor_screen_rect():
@@ -99,14 +155,14 @@ def _caret_screen_rect(anchor_hwnd=None):
         # 若主流程已记录录音开始时的输入窗口，优先用它取 caret，避免退化到左上角。
         fg = anchor_hwnd or _user32.GetForegroundWindow()
         if not fg:
-            _log.debug("caret: no foreground window → 鼠标兜底")
-            return _cursor_screen_rect()
+            _log.debug("caret: no foreground window")
+            return None if anchor_hwnd else _cursor_screen_rect()
         tid = _user32.GetWindowThreadProcessId(fg, None)
         info = _GUITHREADINFO()
         info.cbSize = ctypes.sizeof(info)
         if not _user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
             _log.debug("caret: GetGUIThreadInfo 失败 fg=0x%x tid=%d", fg, tid)
-            return _cursor_screen_rect()
+            return None if anchor_hwnd else _cursor_screen_rect()
         rc = info.rcCaret
         owner = info.hwndCaret or info.hwndFocus
         owner_v = owner if owner else 0
@@ -129,8 +185,8 @@ def _caret_screen_rect(anchor_hwnd=None):
                     caret_h = max(rc.bottom - rc.top, 18)
                     return (pt_s.x, pt_s.y, pt_s.x + 2, pt_s.y + caret_h)
                 _log.debug("caret: GetCaretPos 返回 (0,0) 假阳性，跳过")
-        # 路径 3：兜底鼠标位置
-        return _cursor_screen_rect()
+        # 有本轮已记录的目标窗口时，让调用方先尝试 UIA/窗口边界；不要过早退回鼠标。
+        return None if anchor_hwnd else _cursor_screen_rect()
     except Exception as e:
         _log.warning("caret 抓取异常: %r", e)
         return None
@@ -146,6 +202,100 @@ def _foreground_rect():
         _user32.GetWindowRect(hwnd, ctypes.byref(rc))
         return (rc.left, rc.top, rc.right, rc.bottom)
     except Exception:
+        return None
+
+
+_UIA_INPUT_CONTROL_TYPES = {"EditControl", "DocumentControl", "TextControl", "ComboBoxControl"}
+
+
+def _uia_focused_input_control():
+    """返回当前受支持的 UIA 输入控件；只读，不读取其中的文字。"""
+    import uiautomation as auto
+
+    control = auto.GetFocusedControl()
+    if control is None:
+        return None
+    control_type = getattr(control, "ControlTypeName", "") or ""
+    if control_type not in _UIA_INPUT_CONTROL_TYPES:
+        _log.debug("UIA 焦点控件非输入类，跳过: %s", control_type)
+        return None
+    return control
+
+
+def capture_uia_caret_rect(anchor_hwnd=None):
+    """尝试读取 UIA TextPattern2 的真实插入光标矩形。
+
+    只在热键按下时调用一次。不会读取文本、不激活窗口、不点击、不输入。
+    大部分 Chromium/Electron 输入框尚未实现此接口，返回 None 时由调用方立即
+    回退到现有的 Win32 caret / UIA 控件边界路径。
+    """
+    try:
+        import uiautomation as auto
+        import uiautomation.uiautomation as auto_internal
+
+        control = _uia_focused_input_control()
+        if control is None:
+            return None
+        # uiautomation 的 TextPattern2 包装类尚未暴露 GetCaretRange；通过其已加载的
+        # 系统 COM 接口只读调用。GetCurrentPatternAs 拿不到接口会直接返回 None。
+        interface = auto_internal._AutomationClient.instance().UIAutomationCore.IUIAutomationTextPattern2
+        raw_pattern = control.GetPatternAs(auto.PatternId.TextPattern2, interface._iid_)
+        if raw_pattern is None:
+            _log.debug("UIA TextPattern2 不可用，继续回退")
+            return None
+        result = raw_pattern.GetCaretRange()
+        if not isinstance(result, tuple) or len(result) != 2:
+            _log.debug("UIA TextPattern2 caret 返回格式未知，继续回退")
+            return None
+        is_active, raw_range = result
+        if not is_active or raw_range is None:
+            _log.debug("UIA TextPattern2 caret 未激活，继续回退")
+            return None
+        rects = auto.TextRange(textRange=raw_range).GetBoundingRectangles()
+        if len(rects) != 1:
+            _log.debug("UIA TextPattern2 caret 矩形数量异常: %d", len(rects))
+            return None
+        rect = rects[0]
+        l, t, rr, b = int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+        # 精确 caret 的宽度可能为 0；但高度必须像文字行，且不能跑出屏幕。
+        vl, vt, vr, vb = _virtual_desktop_rect()
+        if b - t < 8 or l < vl - 8 or t < vt - 8 or rr > vr + 8 or b > vb + 8:
+            _log.debug("UIA TextPattern2 caret 矩形无效: (%d,%d,%d,%d)", l, t, rr, b)
+            return None
+        _log.info("浮窗 UIA 精确 caret: rect=(%d,%d,%d,%d)", l, t, rr, b)
+        return (l, t, rr, b)
+    except Exception as exc:
+        _log.debug("UIA TextPattern2 caret 不可用，继续回退: %r", exc)
+        return None
+
+
+def capture_uia_focused_rect(anchor_hwnd=None):
+    """一次性读取 UI Automation 当前焦点控件边界，仅供本轮浮窗定位。
+
+    此函数只读 UIA 属性：不激活窗口、不点击、不输入、不改变焦点。只接受编辑/文档
+    等输入类控件，避免把整个桌面或顶层窗口误当作输入框。
+    """
+    try:
+        import uiautomation as auto
+
+        control = _uia_focused_input_control()
+        if control is None:
+            return None
+        control_type = getattr(control, "ControlTypeName", "") or ""
+        rect = control.BoundingRectangle
+        l, t, rr, b = int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+        if rr - l < 8 or b - t < 8:
+            return None
+        # 顶层网页/桌面有时也会被 UIA 误报为焦点元素；这种近乎整屏的矩形没有定位价值。
+        wl, wt, wr, wb = work_area_for_rect((l, t, rr, b))
+        if rr - l > (wr - wl) * 0.92 and b - t > (wb - wt) * 0.78:
+            _log.debug("UIA 焦点控件范围接近整屏，跳过: type=%s", control_type)
+            return None
+
+        _log.info("浮窗 UIA 锚点: type=%s rect=(%d,%d,%d,%d)", control_type, l, t, rr, b)
+        return (l, t, rr, b)
+    except Exception as exc:
+        _log.debug("UIA 焦点控件不可用，回退窗口锚点: %r", exc)
         return None
 
 
@@ -175,50 +325,91 @@ def _bg_is_light(carert_x, caret_top):
         return None
 
 
-def _compute_anchor(anchor_hwnd=None):
+def _compute_anchor(anchor_hwnd=None, uia_rect=None, uia_caret_rect=None):
     """计算气泡屏幕坐标 (x, y)。
 
     设计 C：气泡中线 = caret.x + OFFSET_X；竖直浮在光标正下方 GAP。
     caret 贴任务栏/屏底时自动翻到光标上方（兑底）。
     兜底：屏幕底部居中。
     """
-    sw = _user32.GetSystemMetrics(0)
-    sh = _user32.GetSystemMetrics(1)
+    vl, vt, vr, vb = _virtual_desktop_rect()
 
-    caret = _caret_screen_rect(anchor_hwnd)
+    def clamp_x(x, area):
+        wl, _wt, wr, _wb = area
+        return max(wl + 8, min(wr - W - 8, x))
+
+    # TextPattern2 由控件自己提供插入点，是 Windows 能拿到时最可靠的位置。
+    # Win32 caret 仍保留为广泛兼容的第二层，后面才是 UIA 控件边界。
+    caret_source = "uia_caret" if uia_caret_rect else "win32_caret"
+    caret = uia_caret_rect or _caret_screen_rect(anchor_hwnd)
+    # Chromium / Electron 偶尔会返回页面顶部的“幽灵 caret”。当 UIA 已经拿到真实
+    # 输入框边界时，caret 必须落在该边界附近才可信；否则宁可用 UIA，不让浮窗跳页顶。
+    if caret and uia_rect:
+        cl, ct, cr, cb = caret
+        ul, ut, ur, ub = uia_rect
+        margin = 32
+        if cr < ul - margin or cl > ur + margin or cb < ut - margin or ct > ub + margin:
+            _log.info(
+                "浮窗忽略异常 caret=(%d,%d,%d,%d)，UIA 输入框=(%d,%d,%d,%d)",
+                cl, ct, cr, cb, ul, ut, ur, ub,
+            )
+            caret = None
     if caret:
         l, t, rr, b = caret
+        area = work_area_for_rect(caret)
+        wl, wt, wr, wb = area
         caret_x = l
         caret_bot = b
         caret_top = t
-        px = max(8, min(sw - W - 8, caret_x + OFFSET_X - W // 2))
-        if caret_bot + GAP + H <= sh - TASKBAR_SAFE:
+        px = clamp_x(caret_x + OFFSET_X - W // 2, area)
+        if caret_bot + GAP + H <= wb - 8:
             py = caret_bot + GAP
         else:
-            py = max(8, caret_top - H - GAP)
+            py = max(wt + 8, caret_top - H - GAP)
+        _log.info("浮窗定位来源=%s rect=(%d,%d,%d,%d)", caret_source, l, t, rr, b)
+        return px, py
+
+    # 无精确 caret 时，优先用按下热键时读取到的 UI Automation 输入控件边界。
+    if uia_rect:
+        l, t, rr, b = uia_rect
+        area = work_area_for_rect(uia_rect)
+        _wl, wt, _wr, wb = area
+        cx = (l + rr) // 2
+        px = clamp_x(cx - W // 2, area)
+        if b + GAP + H <= wb - 8:
+            py = b + GAP
+        else:
+            py = max(wt + 8, t - H - GAP)
+        _log.info("浮窗定位来源=uia_control rect=(%d,%d,%d,%d)", l, t, rr, b)
         return px, py
 
     # 无 caret：锚定到焦点窗口（输入框），贴其底部居中，固定不跟鼠标
     fr = _focus_rect(anchor_hwnd) or _foreground_rect()
     if fr:
         l, t, rr, b = fr
+        area = work_area_for_rect(fr)
+        wl, wt, wr, wb = area
         cx = (l + rr) // 2
-        px = max(8, min(sw - W - 8, cx - W // 2))
-        if b - H - GAP >= 8:
+        px = clamp_x(cx - W // 2, area)
+        if b - H - GAP >= wt + 8:
             py = b - H - GAP
-        elif t + GAP + H <= sh - TASKBAR_SAFE:
+        elif t + GAP + H <= wb - 8:
             py = t + GAP
         else:
-            py = max(8, (t + b) // 2 - H // 2)
+            py = max(wt + 8, min(wb - H - 8, (t + b) // 2 - H // 2))
+        _log.info("浮窗定位来源=target_window rect=(%d,%d,%d,%d)", l, t, rr, b)
         return px, py
 
     cur = _cursor_screen_rect()
     if cur:
+        area = work_area_for_rect(cur)
+        wl, wt, wr, wb = area
         cx = (cur[0] + cur[2]) // 2
-        px = max(8, min(sw - W - 8, cx - W // 2))
-        py = max(8, min(sh - H - 8, cur[3] + GAP))
+        px = clamp_x(cx - W // 2, area)
+        py = max(wt + 8, min(wb - H - 8, cur[3] + GAP))
+        _log.info("浮窗定位来源=mouse")
         return px, py
-    return (sw - W) // 2, sh - 90
+    return (vl + vr - W) // 2, vb - H - 90
 
 
 def _focus_rect(anchor_hwnd=None):
@@ -252,6 +443,11 @@ STATE_TIMEOUT = {}
 AUTO_HIDE = {
     "guide": 3500,
     "error": 2400,
+    "complete": 320,
+}
+FADE_STEPS = {
+    "default": 10,
+    "complete": 6,
 }
 
 
@@ -278,6 +474,8 @@ class PillBubble:
         self._warned_80 = False  # 录音 80s「还剩10秒」是否已提示
         self._light = False  # 当前主题（False=深色）
         self._anchor_hwnd = None  # 本轮录音开始时的输入窗口，仅用于定位，不改变焦点
+        self._uia_anchor_rect = None  # 本轮按下时的 UIA 输入控件边界，仅用于定位
+        self._uia_caret_rect = None  # 本轮按下时的 UIA 精确插入点，优先于 Win32 caret
 
         self.win = tk.Toplevel(master)
         self.win.withdraw()
@@ -318,6 +516,13 @@ class PillBubble:
         self.err_text = self.canvas.create_text(
             DOT_X, H // 2, text="!", fill="#FFFFFF",
             font=("Microsoft YaHei UI", 12, "bold"))
+        # 完成态：绿色圆底对勾，使用普通字符而不是 emoji，避免 Windows 字体替换导致布局跳动。
+        self.done_bg = self.canvas.create_oval(
+            DOT_X - 9, H // 2 - 9, DOT_X + 9, H // 2 + 9,
+            fill="#34C759", outline="")
+        self.done_text = self.canvas.create_text(
+            DOT_X, H // 2 - 1, text="✓", fill="#FFFFFF",
+            font=("Microsoft YaHei UI", 13, "bold"))
         self.text = self.canvas.create_text(
             TEXT_X, H // 2, anchor="w",
             text="", fill=TEXT_DARK, font=FONT)
@@ -325,6 +530,8 @@ class PillBubble:
         self.canvas.itemconfig(self.spinner, state="hidden")
         self.canvas.itemconfig(self.err_bg, state="hidden")
         self.canvas.itemconfig(self.err_text, state="hidden")
+        self.canvas.itemconfig(self.done_bg, state="hidden")
+        self.canvas.itemconfig(self.done_text, state="hidden")
         self.canvas.itemconfig(self.guide_dot, state="hidden")
 
     # ============ 公共接口（主线程调用） ============
@@ -359,8 +566,20 @@ class PillBubble:
         self.win.lift()
         self.win.attributes("-topmost", True)
 
+    def set_anchor_hwnd(self, hwnd):
+        """设置本轮浮窗的定位锚点；仅影响位置，不会激活或切换窗口。"""
+        self._anchor_hwnd = hwnd or None
+
+    def set_uia_anchor_rect(self, rect):
+        """设置本轮已读取的 UIA 输入控件边界；只影响位置，不会改变焦点。"""
+        self._uia_anchor_rect = rect
+
+    def set_uia_caret_rect(self, rect):
+        """设置本轮已读取的 UIA 精确插入点；只影响位置，不会改变焦点。"""
+        self._uia_caret_rect = rect
+
     def _detect_and_apply_theme(self):
-        r = _caret_screen_rect(self._anchor_hwnd)
+        r = self._uia_caret_rect or _caret_screen_rect(self._anchor_hwnd) or self._uia_anchor_rect
         if r:
             light = _bg_is_light(r[0], r[1])
             if light is not None:
@@ -405,6 +624,14 @@ class PillBubble:
         self._fit_error_text(msg)
         self._hide_after = AUTO_HIDE["error"]
 
+    def show_complete(self):
+        """完整输入后给一个极短、确定的收尾反馈，再自动淡出。"""
+        self._enter("complete")
+        self._set_icon("done")
+        self.canvas.itemconfig(self.text, text="输入完成", font=FONT)
+        self.canvas.coords(self.text, TEXT_X, H // 2)
+        self._hide_after = AUTO_HIDE["complete"]
+
     def force_idle(self):
         """立即回到隐藏态（任何异常路径的兜底）。"""
         self._state = "idle"
@@ -434,15 +661,11 @@ class PillBubble:
 
     def _reposition(self):
         """将气泡定位到当前光标正下方（带 OFFSET_X 偏移），每次进入活动态时调用。"""
-        x, y = _compute_anchor(self._anchor_hwnd)
+        x, y = _compute_anchor(self._anchor_hwnd, self._uia_anchor_rect, self._uia_caret_rect)
         try:
             self.win.geometry(f"{W}x{H}+{x}+{y}")
         except Exception:
             pass
-
-    def set_anchor_hwnd(self, hwnd):
-        """设置本轮浮窗的定位锚点；仅影响位置，不会激活或切换窗口。"""
-        self._anchor_hwnd = hwnd or None
 
     def _set_icon(self, which):
         self.canvas.itemconfig(self.dot, state="hidden" if which != "dot" else "normal")
@@ -450,6 +673,9 @@ class PillBubble:
         show_err = which == "error"
         self.canvas.itemconfig(self.err_bg, state="normal" if show_err else "hidden")
         self.canvas.itemconfig(self.err_text, state="normal" if show_err else "hidden")
+        show_done = which == "done"
+        self.canvas.itemconfig(self.done_bg, state="normal" if show_done else "hidden")
+        self.canvas.itemconfig(self.done_text, state="normal" if show_done else "hidden")
         show_gd = which == "guide"
         self.canvas.itemconfig(self.guide_dot, state="normal" if show_gd else "hidden")
 
@@ -506,7 +732,7 @@ class PillBubble:
                 self.canvas.itemconfig(self.text, text="还剩10秒", font=FONT)
                 self.canvas.coords(self.text, TEXT_X, H // 2)
 
-        if self._state == "refining":
+        if self._state in ("transcribing", "refining"):
             self._spin = (self._spin + 12) % 360
             self.canvas.itemconfig(self.spinner, start=self._spin)
 
@@ -516,7 +742,7 @@ class PillBubble:
         if self._hide_after > 0:
             self._hide_after -= 40
             if self._hide_after <= 0:
-                self._fade = 10
+                self._fade = FADE_STEPS["complete"] if self._state == "complete" else FADE_STEPS["default"]
         if self._fade is not None:
             self._fade -= 1
             try:

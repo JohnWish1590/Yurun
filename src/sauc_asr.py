@@ -265,6 +265,8 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
         "opened": threading.Event(),
         "done": threading.Event(),
         "first_partial": False,
+        # 只有服务端明确带 FLAG_LAST 的结果才是可安全输入的完整文本。
+        "final_received": False,
     }
 
     def _on_open(ws):
@@ -297,6 +299,7 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
                     pass
         flags = (message[1] & 0x0F) if len(message) > 1 else 0
         if flags & 0b0010:  # FLAG_LAST 最终结果
+            state["final_received"] = True
             _t("T6")  # Final 结果
             state["done"].set()
 
@@ -305,6 +308,9 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
         state["done"].set()
 
     def _on_close(ws, *args):
+        # 网络中断时可能已经收到 partial；它不能伪装成完整识别结果并被输入。
+        if not state["final_received"] and not state["error"]:
+            state["error"] = "连接在收到最终结果前关闭"
         state["done"].set()
 
     ws = websocket.WebSocketApp(
@@ -352,4 +358,6 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
 
     if state["error"]:
         raise RuntimeError(f"SAUC 错误: {state['error']}")
+    if not state["final_received"]:
+        raise RuntimeError("SAUC 错误: 未收到最终识别结果")
     return state["text"].strip()

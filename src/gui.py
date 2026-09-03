@@ -430,6 +430,17 @@ class SettingsWindow:
                               bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC))
         correction.pack(anchor="w", pady=(FIELD_GAP, 0))
 
+        memory_row = tk.Frame(card, bg=CARD)
+        memory_row.pack(fill="x", pady=(FIELD_GAP, 0))
+        memory_copy = tk.Frame(memory_row, bg=CARD)
+        memory_copy.pack(side="left", fill="x", expand=True)
+        tk.Label(memory_copy, text="个人记忆", bg=CARD, fg=TEXT,
+                 font=FONT(F_ROW, "bold")).pack(anchor="w")
+        tk.Label(memory_copy, text="只保存你主动确认的纠正；可查看、编辑、停用或清空。",
+                 bg=CARD, fg=TEXT_DIM, font=FONT(F_DESC)).pack(anchor="w", pady=(4, 0))
+        PillButton(memory_row, "管理词库", self._open_dictionary_manager,
+                   primary=False, weight="normal", min_w=118).pack(side="right", padx=(16, 0))
+
     # ================= 控件 =================
     def _entry(self, parent, var, width=None, show=None):
         e = tk.Entry(parent, textvariable=var, font=FONT(F_INPUT),
@@ -512,6 +523,14 @@ class SettingsWindow:
             self._refine_adv_box.pack_forget()
         self._refit()
 
+    def _open_dictionary_manager(self):
+        """打开只管理语润自身纠错记录的本地词库窗口。"""
+        try:
+            self._memory_manager = DictionaryManager(self.root)
+        except Exception as exc:
+            log.error("打开词库管理失败: %s", exc)
+            messagebox.showerror("语润", "词库管理无法打开，请查看日志。", parent=self.root)
+
     # ================= 保存 =================
     def _save(self):
         c = self.cfg
@@ -562,6 +581,227 @@ class SettingsWindow:
             self.root.destroy()
         except Exception:
             pass
+
+
+class DictionaryManager:
+    """本地个人记忆管理窗口。
+
+    数据只来自用户主动执行的「替换并存入词库」操作或本窗口手动新增，
+    不监听键盘、不读取剪贴板，也不上传到网络。
+    """
+
+    def __init__(self, master):
+        from dictionary import get_entries
+        from pill import _cursor_screen_rect, work_area_for_rect
+
+        self.win = tk.Toplevel(master)
+        # 与设置窗口保持同一流程：先隐藏，布局与定位完成后才显示。
+        # 否则隐藏 root 作为 owner 时，Windows 会把新窗口重置到 (0, 0)。
+        self.win.withdraw()
+        self.win.title("语润 · 个人记忆")
+        self.win.configure(bg=BG)
+        # 隐藏的常驻 root 没有可靠的窗口位置。按当前鼠标所在显示器居中，
+        # 避免双屏/显示器布局变化后新窗口跑到不可见区域。
+        win_w, win_h = 780, 610
+        wl, wt, wr, wb = work_area_for_rect(_cursor_screen_rect())
+        x = wl + max(0, (wr - wl - win_w) // 2)
+        y = wt + max(0, (wb - wt - win_h) // 2)
+        self._initial_geometry = (win_w, win_h, x, y, (wl, wt, wr, wb))
+        self.win.geometry(f"{win_w}x{win_h}")
+        self.win.minsize(700, 540)
+        # 不设 transient：常驻 root 是隐藏窗口，作为 owner 会让 Windows 把
+        # 子窗口强制重置到左上角/后台。设置页同样不使用 transient。
+        self.win.resizable(True, True)
+
+        self._selected_original = None
+        self._entries = []
+        self.correct_var = tk.StringVar()
+        self.aliases_var = tk.StringVar()
+        self.enabled_var = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar()
+
+        body = tk.Frame(self.win, bg=BG, padx=PAD_X, pady=28)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="个人记忆", bg=BG, fg=TEXT,
+                 font=FONT(30, "bold")).pack(anchor="w")
+        tk.Label(body, text="仅保存你主动确认的纠错。本地存储，不监听键盘，不上传。",
+                 bg=BG, fg=TEXT_DIM, font=FONT(F_DESC)).pack(anchor="w", pady=(5, 20))
+
+        content = tk.Frame(body, bg=BG)
+        content.pack(fill="both", expand=True)
+        content.columnconfigure(0, weight=1, minsize=280)
+        content.columnconfigure(1, weight=1)
+        content.rowconfigure(0, weight=1)
+
+        left = tk.Frame(content, bg=CARD, highlightbackground=CARD_BORDER,
+                        highlightthickness=1, bd=0, padx=18, pady=18)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        tk.Label(left, text="已学习的词条", bg=CARD, fg=TEXT,
+                 font=FONT(F_CARD_TITLE, "bold")).pack(anchor="w", pady=(0, 10))
+        list_box = tk.Frame(left, bg=CARD)
+        list_box.pack(fill="both", expand=True)
+        self.listbox = tk.Listbox(list_box, bg="#FAFAFC", fg=TEXT, selectbackground="#DCEBFA",
+                                  selectforeground=TEXT, activestyle="none", relief="flat", bd=0,
+                                  font=FONT(14), exportselection=False)
+        scroll = tk.Scrollbar(list_box, command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=scroll.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+
+        right = tk.Frame(content, bg=CARD, highlightbackground=CARD_BORDER,
+                         highlightthickness=1, bd=0, padx=24, pady=20)
+        right.grid(row=0, column=1, sticky="nsew")
+        tk.Label(right, text="词条详情", bg=CARD, fg=TEXT,
+                 font=FONT(F_CARD_TITLE, "bold")).pack(anchor="w", pady=(0, 14))
+        self._memory_field(right, "正确写法", self.correct_var)
+        self._memory_field(right, "错误写法（多个用顿号、逗号或换行分开）", self.aliases_var)
+        check = tk.Checkbutton(right, text="启用这条记忆", variable=self.enabled_var,
+                               bg=CARD, fg=TEXT, activebackground=CARD,
+                               activeforeground=TEXT, selectcolor=CARD,
+                               font=FONT(F_DESC))
+        check.pack(anchor="w", pady=(0, 16))
+        tk.Label(right, textvariable=self.status_var, bg=CARD, fg="#16803C",
+                 font=FONT(F_DESC)).pack(anchor="w", pady=(0, 12))
+
+        actions = tk.Frame(right, bg=CARD)
+        actions.pack(fill="x", side="bottom")
+        PillButton(actions, "清空全部", self._clear_all, primary=False,
+                   weight="normal", min_w=106).pack(side="left")
+        PillButton(actions, "删除", self._delete_selected, primary=False,
+                   weight="normal", min_w=82).pack(side="right")
+        PillButton(actions, "保存", self._save_selected, min_w=88).pack(side="right", padx=(0, 10))
+        PillButton(actions, "新建", self._new_entry, primary=False,
+                   weight="normal", min_w=82).pack(side="right", padx=(0, 10))
+
+        self._refresh()
+        # 根窗口是隐藏的常驻窗口；管理页创建后必须主动置前，否则部分 Windows
+        # 环境会把它留在其它应用后面，用户会误以为没有打开。
+        win_w, win_h, x, y, work_area = self._initial_geometry
+        # 必须在全部控件创建后、deiconify 前设置坐标；这是 Tk/Windows 对
+        # withdrawn Toplevel 最稳定的定位时机。
+        self.win.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        self.win.update_idletasks()
+        self.win.deiconify()
+        # 新开窗口由隐藏 root 持有时，部分 Windows 环境不会自动带到前台。
+        # 仅短暂置顶一次，然后立刻恢复普通窗口层级。
+        self.win.attributes("-topmost", True)
+        self.win.lift()
+        self.win.focus_force()
+        self.win.after(350, lambda: self.win.attributes("-topmost", False))
+        # 等窗口首次映射后再写一次坐标，兼容高 DPI / 多屏下 Tk 首次 map 覆盖 geometry。
+        self.win.after(80, lambda: self.win.geometry(f"{win_w}x{win_h}+{x}+{y}"))
+        log.info("个人记忆窗口定位: expected=(%s,%s) actual=(%s,%s) size=%sx%s work_area=%s",
+                 x, y, self.win.winfo_x(), self.win.winfo_y(), win_w, win_h, work_area)
+        log.info("个人记忆管理窗口已显示")
+
+    def _memory_field(self, parent, label, variable):
+        group = tk.Frame(parent, bg=CARD)
+        group.pack(fill="x", pady=(0, 16))
+        tk.Label(group, text=label, bg=CARD, fg=TEXT_LABEL,
+                 font=FONT(F_LABEL, "bold")).pack(anchor="w", pady=(0, 8))
+        entry = tk.Entry(group, textvariable=variable, bg="#FFFFFF", fg=TEXT,
+                         insertbackground=TEXT, relief="flat", bd=0,
+                         highlightthickness=1, highlightbackground=HAIRLINE,
+                         highlightcolor=ACCENT_HOVER, font=FONT(F_INPUT))
+        entry.pack(fill="x", ipady=10)
+
+    @staticmethod
+    def _entry_label(entry):
+        marker = "●" if entry.get("enabled", True) else "○"
+        aliases = "、".join(a.get("text", "") for a in entry.get("aliases") or [])
+        suffix = f" ← {aliases}" if aliases else ""
+        return f"{marker} {entry.get('text', '')}{suffix}"
+
+    def _refresh(self, select_text=None):
+        from dictionary import get_entries
+
+        self._entries = sorted(get_entries(), key=lambda e: e.get("text", "").lower())
+        self.listbox.delete(0, "end")
+        selected_index = None
+        for index, entry in enumerate(self._entries):
+            self.listbox.insert("end", self._entry_label(entry))
+            if entry.get("text") == select_text:
+                selected_index = index
+        if selected_index is not None:
+            self.listbox.selection_set(selected_index)
+            self.listbox.activate(selected_index)
+            self._load_entry(self._entries[selected_index])
+        elif not self._entries:
+            self._new_entry()
+
+    def _on_select(self, _event=None):
+        selection = self.listbox.curselection()
+        if selection:
+            self._load_entry(self._entries[selection[0]])
+
+    def _load_entry(self, entry):
+        self._selected_original = entry.get("text")
+        self.correct_var.set(entry.get("text") or "")
+        self.aliases_var.set("、".join(a.get("text", "") for a in entry.get("aliases") or []))
+        self.enabled_var.set(bool(entry.get("enabled", True)))
+        self.status_var.set("")
+
+    def _new_entry(self):
+        self._selected_original = None
+        self.correct_var.set("")
+        self.aliases_var.set("")
+        self.enabled_var.set(True)
+        self.status_var.set("填写后点击保存。")
+        self.listbox.selection_clear(0, "end")
+
+    @staticmethod
+    def _parse_aliases(value):
+        normalized = (value or "").replace("，", "、").replace(",", "、").replace("\n", "、")
+        return [part.strip() for part in normalized.split("、") if part.strip()]
+
+    def _save_selected(self):
+        from dictionary import add_entry, update_entry
+
+        correct = self.correct_var.get().strip()
+        aliases = self._parse_aliases(self.aliases_var.get())
+        if not correct:
+            self.status_var.set("请填写正确写法。")
+            return
+        try:
+            if self._selected_original is None:
+                add_entry(correct, source="manual")
+                original = correct
+            else:
+                original = self._selected_original
+            update_entry(original, correct, aliases, self.enabled_var.get())
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return
+        except Exception as exc:
+            log.error("保存个人记忆失败: %s", exc)
+            self.status_var.set("保存失败，请查看日志。")
+            return
+        self.status_var.set("已保存到本机。")
+        self._refresh(select_text=correct)
+
+    def _delete_selected(self):
+        from dictionary import delete_entry
+
+        if not self._selected_original:
+            self.status_var.set("请先选择一条词库记录。")
+            return
+        if not messagebox.askyesno("删除词条", f"确定删除“{self._selected_original}”吗？", parent=self.win):
+            return
+        if delete_entry(self._selected_original):
+            self._new_entry()
+            self._refresh()
+            self.status_var.set("已删除。")
+
+    def _clear_all(self):
+        from dictionary import clear_entries
+
+        if not messagebox.askyesno("清空全部个人记忆", "这会删除所有本地词库记录，且无法自动恢复。确定继续吗？", parent=self.win):
+            return
+        clear_entries()
+        self._new_entry()
+        self._refresh()
+        self.status_var.set("已清空全部本地记忆。")
 
 
 # 保持旧导入兼容（部分测试或入口可能直接打开设置窗口）

@@ -65,6 +65,9 @@ class App:
         self._sessions = {}
         self._active_session_id = None
         self._recording_session_id = None
+        # 可选高权限输入助手。存在时只由助手接收主热键和执行输入；
+        # 不可用时完整回退到当前单进程热键路径。
+        self.privileged_bridge = None
         # pynput 纠错热键状态（Ctrl+反引号）
         self._kb = None
         self._kb_listener = None
@@ -112,6 +115,7 @@ class App:
         self.tray = tray_mod.Tray(
             on_quit=self._on_quit,
             on_open_settings=self._open_settings,
+            on_open_dictionary=self._open_dictionary,
             on_set_input_mode=self._set_input_mode,
         )
         tray_mod._tray_instance = self.tray
@@ -125,6 +129,13 @@ class App:
 
     def apply_hotkey_settings(self, key_name, trigger_mode):
         """立即验证并应用新的主热键/触发方式；失败时自动恢复旧热键。"""
+        if self.privileged_bridge and self.privileged_bridge.connected:
+            reply = self.privileged_bridge.request(
+                "reconfigure", {"hotkey": key_name, "trigger_mode": trigger_mode}, timeout=1.2)
+            if reply and reply.get("ok"):
+                log.info("高权限输入助手热键已更新: %s (%s)", key_name, trigger_mode)
+                return True, ""
+            return False, "后台输入助手未能更新热键，设置未保存。"
         old_key = self.cfg.get("hotkey") or "`"
         old_mode = self.cfg.get("trigger_mode") or "hold"
         self.hotkey.stop()
@@ -160,8 +171,14 @@ class App:
         """打字期间优先返回正在输出那一句自己的目标窗口。"""
         if self._type_job is not None:
             session = self._sessions.get(self._type_job["round_id"])
+            if session and session.helper_session_id:
+                # 高权限路径只在原窗口仍处于前台时输入，不从普通权限主程序抢焦点。
+                return None
             if session and session.target_hwnd:
                 return session.target_hwnd
+        active = self._sessions.get(self._active_session_id)
+        if active and active.helper_session_id:
+            return None
         return self._target_hwnd
 
     # ================= UI 事件泵 =================
@@ -203,6 +220,12 @@ class App:
                 return
             if kind == "guide":
                 self.indicator.show_guide("开始录音")
+            elif kind == "open_settings":
+                log.info("主线程打开设置窗口")
+                self._open_settings_ui()
+            elif kind == "open_dictionary":
+                log.info("主线程打开个人记忆窗口")
+                self._open_dictionary_ui()
             elif kind == "recording":
                 # 按下热键：显示「正在录音」+ 红点呼吸
                 self.indicator.start_recording()
@@ -230,6 +253,8 @@ class App:
                 self.indicator.show_error(evt[1])
             elif kind == "show_correction":
                 self._show_correction_dialog()
+            elif kind == "bridge_hotkey":
+                self._handle_privileged_hotkey(evt[1] if len(evt) > 1 else {})
             elif kind == "model_loading":
                 pass  # 仅本地离线模式触发，不打扰
             elif kind in ("model_ready", "model_error"):
@@ -383,10 +408,15 @@ class App:
         except Exception as _e:
             log.warning("WM_DPICHANGED 拦截安装失败，仅用周期兜底: %s", _e)
 
-    def _on_hold_start(self, _key):
+    def _on_hold_start(self, _key, helper_event=None):
         log.info("热键按下，开始录音")
         # 焦点锁定（C1）：记录开始时的目标输入控件；录音/输入期间焦点被切走会抢回
-        target_hwnd = self._get_target_hwnd()
+        target_hwnd = None
+        helper_session_id = None
+        if isinstance(helper_event, dict):
+            target_hwnd = helper_event.get("target_hwnd") or None
+            helper_session_id = helper_event.get("session_id") or None
+        target_hwnd = target_hwnd or self._get_target_hwnd()
         self._target_hwnd = target_hwnd
         log.info("锁定目标窗口 hwnd=%s", self._target_hwnd)
         # 只用于 pill / Partial 浮窗定位，避免 Tk 窗口短暂成为前台时退回屏幕左上角。
@@ -413,6 +443,7 @@ class App:
             target_hwnd=target_hwnd,
             stop_event=threading.Event(),
             config=cfg,
+            helper_session_id=helper_session_id,
         )
         self._sessions[round_id] = session
         self._active_session_id = round_id
@@ -456,6 +487,16 @@ class App:
             self._on_hold_start(_key)
         else:
             self._on_hold_end(_key)
+
+    def _on_privileged_bridge_event(self, event):
+        """桥接线程只投递事件，由 Tk 主线程顺序创建/停止语音会话。"""
+        self.ui_q.put(("bridge_hotkey", event))
+
+    def _handle_privileged_hotkey(self, event):
+        if event.get("event") == "hotkey_down":
+            self._on_hold_start(None, helper_event=event)
+        elif event.get("event") == "hotkey_up":
+            self._on_hold_end(None)
 
     def _on_correct_key(self, _key):
         """纠错热键（Ctrl+反引号）触发：转主线程弹「错误纠正」框。"""
@@ -1410,10 +1451,15 @@ class App:
             from typer import type_text
             session = self._sessions.get(job["round_id"])
             target_hwnd = session.target_hwnd if session else None
-            # 每个队列项只回到自己录音开始时的目标窗口，不能借用最新一轮的全局目标。
-            if target_hwnd and _user32.GetForegroundWindow() != target_hwnd:
-                self._steal_focus(target_hwnd)
-            sent = type_text(ch)
+            if session and session.helper_session_id and self.privileged_bridge:
+                # 高权限目标由助手输入。助手会二次确认原窗口仍在前台；不满足则安全取消，
+                # 绝不写入用户后来切换到的新窗口。
+                sent = self.privileged_bridge.type_character(session.helper_session_id, ch)
+            else:
+                # 每个队列项只回到自己录音开始时的目标窗口，不能借用最新一轮的全局目标。
+                if target_hwnd and _user32.GetForegroundWindow() != target_hwnd:
+                    self._steal_focus(target_hwnd)
+                sent = type_text(ch)
             if sent >= 2:
                 self._record_first_insert(job["round_id"])
             else:
@@ -1443,6 +1489,11 @@ class App:
         """
         cfg = get_config()
         method = (cfg.get("insert_method") or "type").lower()
+        session = self._sessions.get(round_id)
+        if session and session.helper_session_id and method != "type":
+            # 高权限路径不写剪贴板；统一走助手 SendInput，避免普通权限 Ctrl+V 被 UIPI 拦截。
+            log.info("高权限目标强制使用 type 输入路径")
+            method = "type"
         if method == "type" and not replace:
             # 主路径：SendInput 逐字 Unicode 输入，不碰剪贴板
             try:
@@ -1513,6 +1564,11 @@ class App:
         log.info("用户退出")
         self._quit = True
         try:
+            if self.privileged_bridge:
+                self.privileged_bridge.close()
+        except Exception:
+            pass
+        try:
             self.hotkey.stop()
         except Exception:
             pass
@@ -1526,17 +1582,27 @@ class App:
             os._exit(0)
 
     def _open_settings(self):
-        # Tkinter 非线程安全：托盘运行在后台线程，必须用 after(0) 切回主线程操作 Tk
-        try:
-            self.root.after(0, self._open_settings_ui)
-        except Exception as e:
-            log.error("打开设置失败: %s", e)
+        # 托盘回调来自其他线程；Queue 由 Tk 主线程 pump 消费，避免跨线程触碰 Tk。
+        self.ui_q.put(("open_settings",))
 
     def _open_settings_ui(self):
         try:
             SettingsWindow(master=self.root)
         except Exception as e:
             log.error("打开设置失败: %s", e)
+
+    def _open_dictionary(self):
+        """托盘直达个人记忆管理；由 Tk 主线程的 UI 队列创建窗口。"""
+        log.info("托盘请求打开个人记忆，已进入 UI 队列")
+        self.ui_q.put(("open_dictionary",))
+
+    def _open_dictionary_ui(self):
+        try:
+            from gui import DictionaryManager
+            self._dictionary_manager = DictionaryManager(self.root)
+            log.info("个人记忆窗口已创建")
+        except Exception as e:
+            log.error("打开个人记忆界面失败: %s", e)
 
     def _input_mode(self):
         mode = self.cfg.get("input_mode", "direct")
@@ -1588,9 +1654,20 @@ class App:
             self._load_model_async()
         else:
             log.info("识别引擎为 %s，跳过本地模型加载", self.cfg.get("asr_provider"))
-        ok = self.hotkey.start(self.cfg.get("hotkey"), self.cfg.get("trigger_mode", "hold"))
-        if not ok:
-            self.ui_q.put(("toast", "热键无效"))
+        try:
+            from privileged_ipc import PrivilegedBridge
+            bridge = PrivilegedBridge(on_event=self._on_privileged_bridge_event)
+            if bridge.connect():
+                self.privileged_bridge = bridge
+                log.info("主热键与高权限输入已由后台助手接管")
+            else:
+                bridge.close()
+        except Exception as exc:
+            log.debug("高权限输入助手连接跳过: %s", exc)
+        if self.privileged_bridge is None:
+            ok = self.hotkey.start(self.cfg.get("hotkey"), self.cfg.get("trigger_mode", "hold"))
+            if not ok:
+                self.ui_q.put(("toast", "热键无效"))
         # 纠错热键：Ctrl+反引号 —— 用 pynput 全局键盘钩子监听（不依赖 RegisterHotKey：
         # v0.1.17 实测第二热键注册失败且真实错误码被掩盖，pynput 钩子稳定可控；
         # 且实测无修饰反引号热键在带 Ctrl 时不会误触发录音，两键位共存安全）
@@ -1604,8 +1681,9 @@ class App:
             log.info("纠错热键监听已启动: Ctrl+`（pynput）")
         except Exception as e:
             log.warning("pynput 纠错热键监听启动失败: %s", e)
-        # 启动托盘（后台线程）
-        threading.Thread(target=self.tray.start, daemon=True).start()
+        # 先在主线程提交托盘，再进入 Tk mainloop。run_detached 会自行管理
+        # Windows 的托盘消息循环；不要再额外套一层后台线程。
+        self.tray.start(APP_TITLE)
         # 后台预热重依赖，避免首次按下热键才现场加载 numpy/sounddevice/websocket/pyautogui
         threading.Thread(target=self._warmup, daemon=True).start()
         # 主循环（不再弹首次启动引导气泡，避免文字显示不全的干扰）

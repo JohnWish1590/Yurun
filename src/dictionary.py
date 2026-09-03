@@ -7,7 +7,8 @@
   "text": "changelog",                          # 正确写法（唯一键）
   "aliases": [{"text": "天气log", "count": 2}],  # 已知错误变体 + 累计出现次数
   "count": 3,                                   # 总纠正次数（热词权重）
-  "source": "auto"                              # auto=快捷键纠错学习 / manual=手动添加
+  "source": "auto",                             # auto=快捷键纠错学习 / manual=手动添加
+  "enabled": true                                # 可停用，但不丢失学习记录
 }
 
 生效通道（调用方接线）：
@@ -17,6 +18,7 @@
 """
 import json
 import threading
+from copy import deepcopy
 from pathlib import Path
 
 from config import app_data_dir
@@ -71,6 +73,8 @@ def _sanitize(data) -> list:
             "aliases": aliases,
             "count": int(item.get("count") or 1),
             "source": "manual" if item.get("source") == "manual" else "auto",
+            # 旧词库没有该字段时，保持原行为：默认启用。
+            "enabled": bool(item.get("enabled", True)),
         })
     return out
 
@@ -80,14 +84,17 @@ def save(entries: list) -> None:
     _cache = entries
     p = dict_path()
     try:
-        p.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 原子替换，避免异常退出时留下半个 JSON 词库。
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(p)
     except Exception as e:
         log.error("词库保存失败: %s", e)
 
 
 def get_entries() -> list:
     with _lock:
-        return [dict(e) for e in _load()]
+        return deepcopy(_load())
 
 
 def add_entry(correct: str, wrong_text: str = "", source: str = "auto") -> dict:
@@ -119,6 +126,7 @@ def add_entry(correct: str, wrong_text: str = "", source: str = "auto") -> dict:
             "aliases": [{"text": wrong, "count": 1}] if wrong and wrong != correct else [],
             "count": 1,
             "source": source,
+            "enabled": True,
         }
         entries.append(entry)
         save(entries)
@@ -137,6 +145,60 @@ def delete_entry(text: str) -> bool:
         return False
 
 
+def update_entry(original_text: str, correct: str, aliases: list[str], enabled: bool) -> dict:
+    """更新用户在管理界面明确选中的一条本地记忆。
+
+    本函数只接收用户主动保存的内容；不会读取其他应用的文本，也不会推测
+    用户的键盘修改意图。正确写法继续作为唯一键，避免两条规则相互覆盖。
+    """
+    original = (original_text or "").strip()
+    correct = (correct or "").strip()
+    if not original or not correct:
+        raise ValueError("正确写法不能为空")
+    clean_aliases = []
+    seen = set()
+    for alias in aliases or []:
+        value = str(alias or "").strip()
+        if value and value != correct and value not in seen:
+            clean_aliases.append(value)
+            seen.add(value)
+
+    with _lock:
+        entries = _load()
+        entry = next((e for e in entries if e["text"] == original), None)
+        if entry is None:
+            raise ValueError("词条不存在或已被删除")
+        duplicate = next((e for e in entries if e["text"] == correct and e is not entry), None)
+        if duplicate is not None:
+            raise ValueError("已存在相同的正确写法")
+        old_counts = {a["text"]: int(a.get("count") or 1) for a in entry.get("aliases") or []}
+        entry["text"] = correct
+        entry["aliases"] = [
+            {"text": value, "count": old_counts.get(value, 1)}
+            for value in clean_aliases
+        ]
+        entry["enabled"] = bool(enabled)
+        save(entries)
+        return deepcopy(entry)
+
+
+def set_enabled(text: str, enabled: bool) -> bool:
+    """启用或停用一条记忆；停用后不会再参与任何自动使用通道。"""
+    with _lock:
+        entry = next((e for e in _load() if e["text"] == (text or "").strip()), None)
+        if entry is None:
+            return False
+        entry["enabled"] = bool(enabled)
+        save(_load())
+        return True
+
+
+def clear_entries() -> None:
+    """清空全部本地记忆；界面调用前必须已获得用户明确确认。"""
+    with _lock:
+        save([])
+
+
 def to_hotwords(max_tokens: int = HOTWORDS_TOKEN_BUDGET) -> list:
     """按纠正次数降序取正确词，供火山 SAUC 热词直传（源头纠正）。
 
@@ -144,7 +206,10 @@ def to_hotwords(max_tokens: int = HOTWORDS_TOKEN_BUDGET) -> list:
     字符数计更保守）。超出预算截断，火山端还会再兜底截断。
     """
     with _lock:
-        entries = sorted(_load(), key=lambda e: int(e.get("count") or 0), reverse=True)
+        entries = sorted(
+            (e for e in _load() if e.get("enabled", True)),
+            key=lambda e: int(e.get("count") or 0), reverse=True,
+        )
     words = []
     used = 0
     for e in entries:
@@ -163,7 +228,7 @@ def to_replace_map() -> dict:
     同一正确词的多个别名都映射到它；多个正确词共享同一别名时后者覆盖（罕见）。
     """
     with _lock:
-        entries = _load()
+        entries = [e for e in _load() if e.get("enabled", True)]
     m = {}
     for e in entries:
         for a in e["aliases"]:
@@ -193,5 +258,5 @@ def apply_local_replace(text: str) -> str:
 def to_llm_text() -> str:
     """userDictionary 文本：每行一个正确词（长句润色时 LLM 参考）。"""
     with _lock:
-        entries = _load()
+        entries = [e for e in _load() if e.get("enabled", True)]
     return "\n".join(e["text"] for e in entries)

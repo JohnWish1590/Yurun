@@ -12,21 +12,22 @@
 
 当前版本见 `src/logger.py` 的 `YURUN_VERSION` 与 `installer/yurun_setup.iss` 的 `MyAppVersion`，**两者必须保持一致**。
 
-## 当前发布：v1.3.2（2026-08-30）
+## 当前发布：v1.3.3（2026-09-03）
 
-- 发布内容：从 Preview 验收并入会话隔离、完整 Final 结果保护、逐字输入失败可见反馈、脱敏会话轨迹、浮窗完成反馈、输入框锚定和多显示器定位。
-- 发布边界：不包含新的产品功能或焦点策略实验；后续开发从本版本重新建立独立 Preview。
-- 发布资产：`dist/语润.exe` 为本机正式包；如需上传 GitHub，附件使用 ASCII 文件名 `Yurun-v1.3.2.exe`。
-- 回退点：打包前保留的 `dist/语润-v1.3.1-before-v1.3.2.exe`。
+- 发布内容：从 Preview 验收并入个人记忆学习/管理/即时替换，以及安装版的高权限后台输入助手，解决 WorkBuddy 等高权限软件的热键与输入兼容问题。
+- 发布边界：不包含暂停中的 TSF 输入法实验、常驻麦克风、pre-roll、Partial 直接上屏或自动学习键盘内容。后续开发从清空后的独立 `Pre/` 重新开始。
+- 发布资产：`dist/语润.exe`、`dist/YurunInputHelper.exe`、`dist/YurunHelperSetup.exe` 共同组成安装版运行组件；用户分发使用 `dist/语润-Setup-1.3.3.exe`。GitHub Release 附件使用 ASCII 副本 `Yurun-Setup-v1.3.3.exe`。
+- 权限行为：安装时一次性创建登录后的高权限输入助手任务；主程序日常以普通权限运行。卸载器会先删除该任务，再移除程序和 `%APPDATA%\\Yurun` 数据。
+- 回退点：Git 标签 `stable-before-v1.3.3-promotion-20260903` 指向并入前的 v1.3.2 稳定版本。
 
 ## 发布流程（手动）
 
 1. 在 `src/logger.py` 与 `installer/yurun_setup.iss` 同步更新版本号。
 2. 在 `CHANGELOG.md` 顶部按既有格式追加 `[x.y.z]` 条目（编辑 / 涉及文件 / 背景 / 改动点 / 验证 / 行为变化）。
 3. 构建：
-   - `pyinstaller Yurun.spec --noconfirm` → 生成 `dist/语润.exe`。
+   - `pyinstaller Yurun.spec --noconfirm` → 生成 `dist/语润.exe`、`dist/YurunInputHelper.exe`、`dist/YurunHelperSetup.exe`。
    - 用 Inno Setup 构建安装包 `dist/语润-Setup-x.y.z.exe`。
-4. 本地冒烟测试 `dist/语润.exe`（启动 banner 版本号、托盘图标、热键、单次录音润色）。
+4. 本地冒烟测试安装版（启动 banner 版本号、托盘图标、热键、单次录音、个人记忆窗口）；若包含助手，再验证普通启动的语润可向一个高权限测试程序输入。
 5. 提交源码，打标签 `git tag vx.y.z`，推送 `master` 与标签。
 6. 在 GitHub 创建 Release `vx.y.z`，正文贴 CHANGELOG 对应片段，附件挂 `语润.exe` 与安装包。
 

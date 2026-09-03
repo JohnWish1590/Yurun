@@ -9,7 +9,8 @@ from pathlib import Path
 from logger import get_logger
 log = get_logger("yurun.config")
 
-APP_NAME = "Yurun"
+# PRE 由启动器显式标记，配置、日志和词库绝不与正式版共用。
+APP_NAME = "Yurun-Pre" if os.environ.get("YURUN_PRE") == "1" else "Yurun"
 
 def app_data_dir() -> Path:
     base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")

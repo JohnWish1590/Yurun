@@ -16,6 +16,9 @@ class VoiceSession:
     target_hwnd: int | None
     stop_event: threading.Event
     config: dict
+    # 高权限输入助手在热键按下时分配的会话标识；普通路径为 None。
+    # 它只用于把最终文字送回同一次按键锁定的前台窗口，不保存任何文本。
+    helper_session_id: str | None = None
     started_at: float = field(default_factory=time.perf_counter)
     keyup_at: float | None = None
     timeline: dict = field(default_factory=dict)

@@ -1,0 +1,4 @@
+.showcase-frame{padding:18px}
+.product-demo{display:block;width:92%;max-width:900px;height:auto;max-height:440px;border:1px solid #405172;border-radius:12px;box-shadow:0 30px 55px #04071080}
+@media(max-width:800px){.product-demo{width:96%;max-height:340px}}
+@media(max-width:500px){.showcase-frame{padding:12px}.product-demo{width:100%;max-height:290px}}

@@ -325,7 +325,7 @@ def _bg_is_light(carert_x, caret_top):
         return None
 
 
-def _compute_anchor(anchor_hwnd=None, uia_rect=None, uia_caret_rect=None):
+def _compute_anchor(anchor_hwnd=None, uia_rect=None, uia_caret_rect=None, frozen_mouse_rect=None):
     """计算气泡屏幕坐标 (x, y)。
 
     设计 C：气泡中线 = caret.x + OFFSET_X；竖直浮在光标正下方 GAP。
@@ -383,7 +383,21 @@ def _compute_anchor(anchor_hwnd=None, uia_rect=None, uia_caret_rect=None):
         _log.info("浮窗定位来源=uia_control rect=(%d,%d,%d,%d)", l, t, rr, b)
         return px, py
 
-    # 无 caret：锚定到焦点窗口（输入框），贴其底部居中，固定不跟鼠标
+    # UIA 无法识别 Electron / Chromium 的编辑区时，使用“按下热键瞬间”的鼠标
+    # 位置作为本轮稳定锚点。它不是持续跟随鼠标：一次录音只读取一次，因此用户
+    # 说话期间移动指针也不会带着浮窗跑。把它放在整窗回退之前，可避免全屏窗口
+    # （例如 WorkBuddy）把浮窗错误放到屏幕最上方。
+    if frozen_mouse_rect:
+        l, t, rr, b = frozen_mouse_rect
+        area = work_area_for_rect(frozen_mouse_rect)
+        _wl, wt, _wr, wb = area
+        cx = (l + rr) // 2
+        px = clamp_x(cx - W // 2, area)
+        py = max(wt + 8, min(wb - H - 8, b + GAP))
+        _log.info("浮窗定位来源=frozen_mouse rect=(%d,%d,%d,%d)", l, t, rr, b)
+        return px, py
+
+    # 最后才锚定到整个焦点窗口；这是没有可用输入控件或按下坐标时的兜底。
     fr = _focus_rect(anchor_hwnd) or _foreground_rect()
     if fr:
         l, t, rr, b = fr
@@ -476,6 +490,7 @@ class PillBubble:
         self._anchor_hwnd = None  # 本轮录音开始时的输入窗口，仅用于定位，不改变焦点
         self._uia_anchor_rect = None  # 本轮按下时的 UIA 输入控件边界，仅用于定位
         self._uia_caret_rect = None  # 本轮按下时的 UIA 精确插入点，优先于 Win32 caret
+        self._frozen_mouse_rect = None  # 本轮热键按下瞬间坐标，非持续鼠标跟随
 
         self.win = tk.Toplevel(master)
         self.win.withdraw()
@@ -578,6 +593,10 @@ class PillBubble:
         """设置本轮已读取的 UIA 精确插入点；只影响位置，不会改变焦点。"""
         self._uia_caret_rect = rect
 
+    def set_frozen_mouse_rect(self, rect):
+        """设置本轮热键按下瞬间的鼠标坐标；只影响定位，不读取后续鼠标移动。"""
+        self._frozen_mouse_rect = rect
+
     def _detect_and_apply_theme(self):
         r = self._uia_caret_rect or _caret_screen_rect(self._anchor_hwnd) or self._uia_anchor_rect
         if r:
@@ -661,7 +680,12 @@ class PillBubble:
 
     def _reposition(self):
         """将气泡定位到当前光标正下方（带 OFFSET_X 偏移），每次进入活动态时调用。"""
-        x, y = _compute_anchor(self._anchor_hwnd, self._uia_anchor_rect, self._uia_caret_rect)
+        x, y = _compute_anchor(
+            self._anchor_hwnd,
+            self._uia_anchor_rect,
+            self._uia_caret_rect,
+            self._frozen_mouse_rect,
+        )
         try:
             self.win.geometry(f"{W}x{H}+{x}+{y}")
         except Exception:

@@ -12,13 +12,13 @@
 
 当前版本见 `src/logger.py` 的 `YURUN_VERSION` 与 `installer/yurun_setup.iss` 的 `MyAppVersion`，**两者必须保持一致**。
 
-## 当前发布：v1.3.3（2026-09-03）
+## 当前发布：v1.3.4（2026-09-04）
 
-- 发布内容：从 Preview 验收并入个人记忆学习/管理/即时替换，以及安装版的高权限后台输入助手，解决 WorkBuddy 等高权限软件的热键与输入兼容问题。
-- 发布边界：不包含暂停中的 TSF 输入法实验、常驻麦克风、pre-roll、Partial 直接上屏或自动学习键盘内容。后续开发从清空后的独立 `Pre/` 重新开始。
-- 发布资产：`dist/语润.exe`、`dist/YurunInputHelper.exe`、`dist/YurunHelperSetup.exe` 共同组成安装版运行组件；用户分发使用 `dist/语润-Setup-1.3.3.exe`。GitHub Release 附件使用 ASCII 副本 `Yurun-Setup-v1.3.3.exe`。
+- 发布内容：从 Preview 验收并入浮窗定位回退和长文本动画收尾修复。针对 WorkBuddy、Codex 等 Electron / Chromium 界面，在无法读取 caret 或 UIA 输入控件时，浮窗固定使用热键按下瞬间的位置；长文本动画依据已确认输入的字符进度收尾，并仅略早于最终文字结束。
+- 发布边界：不包含暂停中的 TSF 输入法实验、常驻麦克风、pre-roll、Partial 直接上屏、自动学习键盘内容或焦点策略实验。拼音候选栏仍由用户现有输入法绘制，不被语润修改。
+- 发布资产：`dist/语润.exe`、`dist/YurunInputHelper.exe`、`dist/YurunHelperSetup.exe` 共同组成安装版运行组件；用户分发使用 `dist/语润-Setup-1.3.4.exe`。GitHub Release 附件使用 ASCII 副本 `Yurun-Setup-v1.3.4.exe`。
 - 权限行为：安装时一次性创建登录后的高权限输入助手任务；主程序日常以普通权限运行。卸载器会先删除该任务，再移除程序和 `%APPDATA%\\Yurun` 数据。
-- 回退点：Git 标签 `stable-before-v1.3.3-promotion-20260903` 指向并入前的 v1.3.2 稳定版本。
+- 回退点：Git 标签 `stable-before-v1.3.4-promotion-20260904` 指向并入前的 v1.3.3 稳定版本。
 
 ## 发布流程（手动）
 

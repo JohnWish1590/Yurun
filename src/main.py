@@ -79,12 +79,18 @@ class App:
         # Phase 1 验证浮窗：独立 Toplevel，实时显示 SAUC Partial（不抢焦点/不 SendInput/不碰 TSF）。
         self._partial_win = None
         self._partial_lbl = None
-        # 浮窗"逐字被吸进文本框"动画状态：删字用独立的慢速定时器驱动（与打字解耦），
-        # 让吸走明显慢于打字，避免"一下全没"；打字结束后若有剩字也由它慢慢收尾。
+        # 浮窗逐字吸走动画：以“已经确认送入目标程序”的字符数为节拍，而非以
+        # 猜测的毫秒倒计时为节拍。高权限输入助手逐字 IPC 较慢时，这能避免浮窗
+        # 提前一大段消失；同时允许它以很小、渐进的领先量先于真实输入收尾。
         self._partial_finishing = False
         self._partial_finish_id = None
         self._draining = False
-        self._drain_interval = 30  # 删字节奏：每 30ms 删 1 字（打字 40ms/字，用户实测最满意的伴随节奏）
+        self._drain_interval = 26
+        self._preview_total_chars = 0
+        self._preview_input_total = 0
+        self._preview_sent_chars = 0
+        self._preview_removed_chars = 0
+        self._preview_lead_chars = 0
         # 异步打字：每句话拥有独立队列项。这样上一句尚在输出时开始下一句，
         # 也不会把两句字符混进同一个缓冲区或错误目标窗口。
         self._type_jobs = deque()
@@ -247,6 +253,7 @@ class App:
                 self.indicator.set_anchor_hwnd(None)
                 self.indicator.set_uia_anchor_rect(None)
                 self.indicator.set_uia_caret_rect(None)
+                self.indicator.set_frozen_mouse_rect(None)
                 self._hide_partial()
                 self.indicator.show_error(evt[1] if len(evt) > 1 else "出错了")
             elif kind == "toast":
@@ -421,6 +428,13 @@ class App:
         log.info("锁定目标窗口 hwnd=%s", self._target_hwnd)
         # 只用于 pill / Partial 浮窗定位，避免 Tk 窗口短暂成为前台时退回屏幕左上角。
         self.indicator.set_anchor_hwnd(self._target_hwnd)
+        # Electron/Chromium 可能不暴露文字 caret 或可用输入控件。只在热键按下
+        # 的这一刻冻结鼠标位置，作为整窗回退之前的稳定锚点；不会持续跟着鼠标跑。
+        try:
+            from pill import _cursor_screen_rect
+            self.indicator.set_frozen_mouse_rect(_cursor_screen_rect())
+        except Exception:
+            self.indicator.set_frozen_mouse_rect(None)
         # 只读一次 UIA：优先取系统提供的真实插入点；不支持时保留控件边界作为下一层回退。
         # 两者都只读属性，不会激活窗口、点击或读取用户输入的文字。
         try:
@@ -1007,8 +1021,10 @@ class App:
                 pass
 
     def _start_drain(self):
-        """启动（或续跑）独立的慢速删字定时器：与打字解耦，明显慢于打字，
-        让浮窗逐字「吸走」的动画清晰可见，而不是跟打字同速一下退完。"""
+        """异常兜底收尾：正常路径由已确认的输入进度直接驱动。
+
+        这个定时器只负责极少量残字，绝不再和真实输入并行“猜速度”。
+        """
         if self._draining:
             return
         if self._partial_win is None:
@@ -1017,10 +1033,7 @@ class App:
         if not cur:
             self._partial_win.withdraw()
             return
-        try:
-            log.debug("浮窗慢速删字启动: 当前长度=%d 间隔=%dms", len(cur), self._drain_interval)
-        except Exception:
-            pass
+        log.debug("浮窗兜底收尾: 当前长度=%d 间隔=%dms", len(cur), self._drain_interval)
         self._draining = True
         self.root.after(self._drain_interval, self._drain_timer_step)
 
@@ -1041,8 +1054,7 @@ class App:
             self._draining = False
 
     def _finish_partial_drain(self):
-        """打字/粘贴结束后，若浮窗还有剩字，转入慢速删字定时器慢慢收尾，
-        避免"字先打完、浮窗还挂着"（用户要求浮窗不晚于文字结束）。"""
+        """打字结束后的极端兜底；正常情况下浮窗会已略早于输入完成。"""
         if self._partial_finishing:
             return
         self._partial_finishing = True
@@ -1378,12 +1390,14 @@ class App:
         # 同一流式润色会话的 delta 追加到自己的末尾；不同会话则独立排队。
         if self._type_job is not None and self._type_job["round_id"] == round_id:
             self._type_job["buffer"] += text
+            self._type_job["total_chars"] += len(text)
             self._type_job["interval_ms"] = interval_ms
             if on_done is not None:
                 self._type_job["on_done"] = on_done
         elif self._type_jobs and self._type_jobs[-1]["round_id"] == round_id:
             job = self._type_jobs[-1]
             job["buffer"] += text
+            job["total_chars"] += len(text)
             job["interval_ms"] = interval_ms
             if on_done is not None:
                 job["on_done"] = on_done
@@ -1391,14 +1405,57 @@ class App:
             self._type_jobs.append({
                 "round_id": round_id,
                 "buffer": text,
+                "total_chars": len(text),
+                "sent_chars": 0,
                 "interval_ms": interval_ms,
                 "on_done": on_done,
             })
         if not self._typing:
             self._typing = True
             self.root.after(0, self._type_step)
-            # 打字一开始即启动慢速删字（开头对齐打字），与打字解耦、明显慢于打字
-            self._start_drain()
+
+    def _begin_preview_progress(self, job):
+        """绑定浮窗到一个输入任务，预览在末段以小幅领先量结束。"""
+        if self._partial_win is None or not self._partial_win.winfo_viewable():
+            return
+        text = self._partial_lbl.cget("text") or ""
+        self._preview_total_chars = len(text)
+        self._preview_input_total = max(1, int(job.get("total_chars") or 1))
+        self._preview_sent_chars = 0
+        self._preview_removed_chars = 0
+        # 领先量按文本长度渐进累积：短句只领先 1 字，长句最多 10 字。
+        # 首字不会一下吞掉一段，最后几字前才自然完成。
+        self._preview_lead_chars = min(10, max(1, round(self._preview_total_chars * 0.10)))
+        log.debug(
+            "浮窗进度绑定: preview=%d input=%d lead=%d",
+            self._preview_total_chars, self._preview_input_total, self._preview_lead_chars,
+        )
+
+    def _advance_preview_progress(self, sent_chars):
+        """根据已成功输入的字符数，平滑删掉对应的浮窗前缀。"""
+        if self._preview_total_chars <= 0 or self._partial_win is None:
+            return
+        self._preview_sent_chars = max(self._preview_sent_chars, sent_chars)
+        # 领先量随已输入进度逐步增加：开始时仍是一字对一字，末段才略早结束。
+        desired = (self._preview_sent_chars *
+                   (self._preview_total_chars + self._preview_lead_chars)) // self._preview_input_total
+        desired = min(self._preview_total_chars, max(0, desired))
+        count = desired - self._preview_removed_chars
+        if count <= 0:
+            return
+        cur = self._partial_lbl.cget("text") or ""
+        # 单次最多删两字，避免因个别慢 IPC 回调让视觉突然跳一大段。
+        count = min(count, 2, len(cur))
+        if not count:
+            return
+        self._partial_lbl.configure(text=cur[count:])
+        self._preview_removed_chars += count
+        try:
+            self._partial_win.update_idletasks()
+            if not (self._partial_lbl.cget("text") or ""):
+                self._partial_win.withdraw()
+        except Exception:
+            pass
 
     def _abort_type_job(self, job, reason):
         """停止一个无法确认完整投递的会话，绝不自动重试同一字符。"""
@@ -1420,7 +1477,9 @@ class App:
                 return
             self._type_job = self._type_jobs.popleft()
             self._type_interval_ms = self._type_job["interval_ms"]
-            self._drain_interval = max(8, int(self._type_interval_ms * 0.75))
+            self._drain_interval = 26
+            if self._is_active_session(self._type_job["round_id"]):
+                self._begin_preview_progress(self._type_job)
 
         job = self._type_job
         if not job["buffer"]:
@@ -1462,6 +1521,9 @@ class App:
                 sent = type_text(ch)
             if sent >= 2:
                 self._record_first_insert(job["round_id"])
+                job["sent_chars"] += 1
+                if self._is_active_session(job["round_id"]):
+                    self._advance_preview_progress(job["sent_chars"])
             else:
                 # 一个 Unicode 字需要 key-down + key-up 两个事件。少于两个就不能确认
                 # 该字已完整进入目标程序；此时绝不自动重试，避免重复字或半个代理对。

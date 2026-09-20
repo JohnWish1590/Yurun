@@ -633,6 +633,13 @@ class PillBubble:
         self.canvas.itemconfig(self.text, text="正在识别", font=FONT)
         self.canvas.coords(self.text, TEXT_X, H // 2)
 
+    def show_retrying(self):
+        """最终结果连接中断后，仅一次完整音频重试期间显示。"""
+        self._enter("retrying")
+        self._set_icon("spinner")
+        self.canvas.itemconfig(self.text, text="正在重试", font=FONT)
+        self.canvas.coords(self.text, TEXT_X, H // 2)
+
     def show_error(self, msg="出错了"):
         self._enter("error")
         self._set_icon("error")

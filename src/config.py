@@ -40,12 +40,19 @@ DEFAULTS = {
     "asr_sauc_endpoint": "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
     "whisper_model": "small",          # 本地模型：base / small（推荐 small）
     "language": "auto",                # zh / en / auto
-    # 热键
+    # 热键。修饰键用 MOD_* 位掩码存整数：Alt=1 / Ctrl=2 / Shift=4 / Win=8，
+    # 0 表示裸键。键名与修饰键分开存，解析时不需要拆字符串。
     "hotkey": "`",                     # 默认反引号
+    "hotkey_modifiers": 0,             # 主热键修饰键；0 = 裸反引号
     "trigger_mode": "hold",            # hold=按住说话 / toggle=单击开关
-    "correction_hotkey": "`",          # 纠错热键（Ctrl+此键 弹「错误纠正」框）
+    "correction_hotkey": "`",          # 纠错热键的键（默认反引号）
+    # 默认 Alt+`：与旧版本"左 Alt + 反引号"保持一致。旧配置里没有这个字段，
+    # 会由 DEFAULTS 补上，因此升级后行为不变。
+    "correction_hotkey_modifiers": 1,  # 1 = MOD_ALT
     # 设置窗口上一次正常关闭时的位置。仅保存坐标，窗口尺寸由界面自动计算。
     "settings_window_position": None,
+    # 纠错窗口上一次拖动后的位置；仅保存坐标，窗口尺寸由界面自动计算。
+    "correction_window_position": None,
     # 其他
     "auto_start": False,
     "proxy": "",                       # 留空=不走代理，如 http://127.0.0.1:7897

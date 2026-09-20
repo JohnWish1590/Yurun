@@ -17,6 +17,10 @@ user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
 WM_HOTKEY = 0x0312
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 WH_KEYBOARD_LL = 13
 HC_ACTION = 0
@@ -90,6 +94,97 @@ def _vk_for(name: str) -> int:
     return 0
 
 
+# 修饰键显示顺序 = 位掩码从"强"到"弱"，与主流软件一致。
+MOD_LABELS = (
+    (MOD_CONTROL, "Ctrl"),
+    (MOD_ALT, "Alt"),
+    (MOD_SHIFT, "Shift"),
+    (MOD_WIN, "Win"),
+)
+
+
+def vk_to_name(vk: int) -> str:
+    """把虚拟键码还原成配置里使用的键名；无法识别返回空串。
+
+    这是 `_vk_for` 的逆运算，供设置界面录制组合键时使用。字母统一返回大写，
+    与 `_vk_for` 里 `ord(c.upper())` 的写法对应，保证来回转换稳定。
+    """
+    if not vk:
+        return ""
+    for name, code in VK_MAP.items():
+        if code == vk:
+            return name
+    for name, code in PUNCT_VK.items():
+        if code == vk:
+            return name
+    if 0x41 <= vk <= 0x5A or 0x30 <= vk <= 0x39:
+        return chr(vk)
+    return ""
+
+
+def format_hotkey(modifiers: int, key_name: str) -> str:
+    """生成组合键的可读名，如 ``Ctrl + Shift + K`` / ``Alt + ` `` / ``F8``。"""
+    parts = [label for bit, label in MOD_LABELS if modifiers & bit]
+    parts.append(key_name or "?")
+    return " + ".join(parts)
+
+
+def hotkey_id(modifiers: int, key_name: str) -> tuple:
+    """组合键的唯一标识 (修饰位, VK)，用于查重两个热键是否冲突。
+
+    查重必须基于 VK 而不是键名：``A`` 与 ``a`` 是同一个键，
+    ``LAlt`` 与 ``Alt`` 走的是同一位掩码，用 (mods, vk) 比才可靠。
+    """
+    return (int(modifiers or 0), _vk_for(key_name))
+
+
+def pynput_vk(key) -> int:
+    """从 pynput 的按键对象取 Windows VK 码；取不到返回 0。
+
+    ⚠️ 必须同时探查两处，只读 `.vk` 会**静默丢掉所有特殊键**：
+
+    * 普通字符键 → pynput 给的是 ``KeyCode``，它直接有 ``.vk``。
+    * F1-F12、方向键、Home/End/Delete 等 → pynput 给的是 ``Key`` **枚举成员**，
+      成员本身**没有** ``.vk``（``getattr(Key.f9, 'vk') is None``），真正的 VK 在
+      ``Key.f9.value.vk``（120 = 0x78）。
+
+    只在 KeyCode 上取 vk 的写法表现为"F8 这类键录不进去 / 配成纠错热键后完全没
+    反应"，而且不报错 —— 很难自查。
+    """
+    for candidate in (key, getattr(key, "value", None)):
+        if candidate is None:
+            continue
+        vk = getattr(candidate, "vk", None)
+        if isinstance(vk, int) and vk:
+            return vk
+    return 0
+
+
+def pynput_mod_bit(key) -> int:
+    """把 pynput 的按键对象映射成 MOD_* 位；不是修饰键则返回 0。
+
+    供 pynput 路径（纠错热键回退、设置界面的组合键录制）共用。
+    pynput 在 Windows 上把右 Alt 报成 ``alt_gr``，且不同版本暴露的属性名
+    不完全一致，所以逐个用 getattr 探测；pynput 本身按需导入，避免变成
+    模块级硬依赖。
+    """
+    try:
+        from pynput import keyboard as _kb
+    except Exception:
+        return 0
+    for names, bit in (
+        (("ctrl_l", "ctrl_r"), MOD_CONTROL),
+        (("alt_l", "alt_r", "alt_gr"), MOD_ALT),
+        (("shift", "shift_l", "shift_r"), MOD_SHIFT),
+        (("cmd", "cmd_l", "cmd_r"), MOD_WIN),
+    ):
+        for attr in names:
+            candidate = getattr(_kb.Key, attr, None)
+            if candidate is not None and key == candidate:
+                return bit
+    return 0
+
+
 # ---- Win32 函数签名（防 64 位指针截断）----
 user32.DefWindowProcW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
 user32.DefWindowProcW.restype = wt.LPARAM
@@ -107,6 +202,9 @@ user32.CreateWindowExW.argtypes = [ctypes.c_uint, wt.LPCWSTR, wt.LPCWSTR, ctypes
 user32.CreateWindowExW.restype = wt.HWND
 user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
 user32.RegisterClassW.restype = ctypes.c_ushort
+user32.PostMessageW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+user32.PostMessageW.restype = ctypes.c_bool
+user32.PostQuitMessage.argtypes = [ctypes.c_int]
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetAsyncKeyState.restype = ctypes.c_short
 _LOWLEVELPROC = ctypes.WINFUNCTYPE(wt.LPARAM, ctypes.c_int, wt.WPARAM, wt.LPARAM)
@@ -121,6 +219,54 @@ kernel32.GetModuleHandleW.restype = wt.HINSTANCE
 
 _WNDPROC = ctypes.WINFUNCTYPE(wt.LPARAM, wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM)
 _CLASS_REGISTERED = False
+WINDOW_CLASS_NAME = "YurunHotkeyWindow"
+# 窗口类在一个进程里只能注册一次，所以 lpfnWndProc 必须是**进程级**函数，
+# 绝不能绑到某个 listener 的 bound method 上：否则后来创建的窗口会共用第一个
+# listener 的回调，"第二个热键"的 WM_HOTKEY 会被送进第一个 listener。
+# 实测（生产顺序：主热键裸反引号先注册类、纠错键 Alt+反引号 后加入）：按下
+# Alt+反引号 触发的是**主热键的录音回调**，纠错窗口根本收不到 —— 这正是
+# "能录音但唤不出纠错窗口"的真因。这里按 hwnd 找到真正的 owner 再派发。
+_CLASS_WNDPROC = None
+_LISTENERS = {}
+_LISTENERS_LOCK = threading.Lock()
+
+# "请退出消息循环"的自定义消息（WM_APP 之后的第一个值）。
+WM_APP_CLOSE = 0x8000 + 1
+
+
+def _class_wndproc(hwnd, msg, wparam, lparam):
+    """所有热键窗口共用的窗口过程：按 hwnd 派发给对应的 listener。
+
+    消息由**拥有该窗口的线程**送进来（也就是各自 listener 的消息循环线程），
+    所以取到 owner 后直接调用它是线程安全的。
+
+    窗口过程绝不能让异常逃出去：ctypes 回调里抛异常会让返回值不确定，消息分发
+    也就跟着乱掉。所有派发都包一层。
+    """
+    if msg == WM_HOTKEY and wparam == 1:
+        try:
+            with _LISTENERS_LOCK:
+                target = _LISTENERS.get(hwnd)
+            if target is not None:
+                target._on_hotkey_pressed()
+        except Exception:
+            log.exception("热键窗口过程派发异常")
+        return 0
+    if msg == WM_APP_CLOSE:
+        # stop() 从别的线程 Post 进来：窗口属于本线程，销毁必须在**本线程**做
+        # （DestroyWindow 跨线程会失败，窗口泄漏的同时热键一直占着，用户改完
+        # 快捷键会发现"新组合注册不上、旧组合还在响应"）。这里只置标志并让
+        # 消息循环退出，真正的 UnregisterHotKey + DestroyWindow 在 _run 收尾。
+        try:
+            with _LISTENERS_LOCK:
+                target = _LISTENERS.get(hwnd)
+            if target is not None:
+                target._running = False
+            user32.PostQuitMessage(0)
+        except Exception:
+            log.exception("热键窗口关闭消息处理异常")
+        return 0
+    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
 
 class HotkeyListener:
@@ -128,7 +274,7 @@ class HotkeyListener:
         self._hwnd = None
         self._vk = 0
         self._key_name = None
-        self._wndproc_obj = None
+        self._modifiers = 0
         self._keyboard_proc_obj = None
         self._keyboard_hook = None
         self._uses_keyboard_hook = False
@@ -150,18 +296,26 @@ class HotkeyListener:
         self._start_ready = threading.Event()
         self._start_error = None
 
-    def start(self, key_name: str, trigger_mode: str = "hold") -> bool:
+    def start(self, key_name: str, trigger_mode: str = "hold", modifiers: int = 0) -> bool:
+        """注册一个全局热键。
+
+        modifiers 为 MOD_* 位掩码（0 = 裸键）。带修饰键时必须走
+        RegisterHotKey：低层键盘钩子路径只服务裸反引号（钩子回调里
+        `_modifier_down()` 会把带修饰键的按键直接放行）。
+        """
         self._vk = _vk_for(key_name)
         if self._vk == 0:
             self._fail("按键无效")
             return False
         self._key_name = key_name
+        self._modifiers = modifiers
         self.trigger_mode = trigger_mode
         self._pressed = False
         self._suppressed_key_down = False
         self._press_source = None
-        # 仅为裸反引号启用钩子；其他热键继续沿用系统热键注册。
-        self._uses_keyboard_hook = self._vk == VK_MAP["`"] and key_name == "`"
+        # 仅为裸反引号启用钩子；其他热键（含带修饰键的组合）继续沿用系统热键注册。
+        self._uses_keyboard_hook = (
+            modifiers == 0 and self._vk == VK_MAP["`"] and key_name == "`")
         self._registered_hotkey = False
         self._start_error = None
         self._start_ready.clear()
@@ -243,7 +397,7 @@ class HotkeyListener:
                     self._queue_event("hold_end")
                 return 1
 
-            # Ctrl+` 等组合键不在本次修复范围，保持原有纠错快捷键等行为。
+            # 带修饰键的组合（例如纠错热键 左Alt+`）一律放行，交给 pynput 钩子处理。
             if self._modifier_down():
                 return user32.CallNextHookEx(self._keyboard_hook, n_code, wparam, lparam)
 
@@ -267,20 +421,27 @@ class HotkeyListener:
         return user32.CallNextHookEx(self._keyboard_hook, n_code, wparam, lparam)
 
     def stop(self):
+        """停掉热键监听并**真正释放**热键与窗口。
+
+        窗口和消息循环都在 self._thread 上，DestroyWindow 不能跨线程调用
+        （会返回 FALSE，窗口泄漏、热键继续响应）。所以先 Post 一条自定义消息
+        请消息循环退出，由它自己在收尾里 UnregisterHotKey + DestroyWindow。
+        """
         self._running = False
+        hwnd = self._hwnd
+        if hwnd:
+            try:
+                user32.PostMessageW(hwnd, WM_APP_CLOSE, 0, 0)
+            except Exception:
+                pass
+        # 钩子可以跨线程卸下，先卸掉能更快地不再吃按键。
         try:
             if self._keyboard_hook:
                 user32.UnhookWindowsHookEx(self._keyboard_hook)
-                self._keyboard_hook = None
-            self._keyboard_proc_obj = None
-            if self._hwnd:
-                if self._registered_hotkey:
-                    user32.UnregisterHotKey(self._hwnd, 1)
-                    self._registered_hotkey = False
-                user32.DestroyWindow(self._hwnd)
-                self._hwnd = None
         except Exception:
             pass
+        self._keyboard_proc_obj = None
+
         if self._thread:
             self._thread.join(timeout=1)
         if self._poll_thread:
@@ -288,29 +449,49 @@ class HotkeyListener:
         if self._dispatch_thread:
             self._dispatch_thread.join(timeout=1)
 
+        # 兜底：消息循环没按预期退出（例如线程早已异常结束）时再做一次清理，
+        # 尽可能不让热键被"僵尸窗口"占住。
+        if self._hwnd:
+            try:
+                with _LISTENERS_LOCK:
+                    _LISTENERS.pop(self._hwnd, None)
+                if self._registered_hotkey:
+                    user32.UnregisterHotKey(self._hwnd, 1)
+                    self._registered_hotkey = False
+                user32.DestroyWindow(self._hwnd)
+            except Exception:
+                pass
+            self._hwnd = None
+        self._keyboard_hook = None
+
     def _run(self):
-        global _CLASS_REGISTERED
+        global _CLASS_REGISTERED, _CLASS_WNDPROC
         if not _CLASS_REGISTERED:
+            if _CLASS_WNDPROC is None:
+                # 窗口过程必须一直活着，否则 ctypes 回收后指针悬空。
+                _CLASS_WNDPROC = _WNDPROC(_class_wndproc)
             wc = _WNDCLASSW()
-            self._wndproc_obj = _WNDPROC(self._wndproc)
-            wc.lpfnWndProc = ctypes.cast(self._wndproc_obj, ctypes.c_void_p)
+            wc.lpfnWndProc = ctypes.cast(_CLASS_WNDPROC, ctypes.c_void_p)
             wc.hInstance = kernel32.GetModuleHandleW(None)
-            wc.lpszClassName = "YurunHotkeyWindow"
+            wc.lpszClassName = WINDOW_CLASS_NAME
             if not user32.RegisterClassW(ctypes.byref(wc)):
                 self._fail("启动失败")
                 return
             _CLASS_REGISTERED = True
 
         self._hwnd = user32.CreateWindowExW(
-            0, "YurunHotkeyWindow", "Yurun", 0, 0, 0, 0, 0,
+            0, WINDOW_CLASS_NAME, "Yurun", 0, 0, 0, 0, 0,
             0, 0, kernel32.GetModuleHandleW(None), 0)
         if not self._hwnd:
             self._fail("启动失败")
             return
+        # 让进程级窗口过程知道这个窗口归谁，WM_HOTKEY 才能派回正确的 listener。
+        with _LISTENERS_LOCK:
+            _LISTENERS[self._hwnd] = self
 
         # 保留系统热键作为反引号钩子的兜底：某个第三方程序若抢在钩子链前面
         # 截断事件，语润至少仍能开始/结束录音，不会失去主热键。
-        registered = user32.RegisterHotKey(self._hwnd, 1, MOD_NOREPEAT, self._vk)
+        registered = user32.RegisterHotKey(self._hwnd, 1, MOD_NOREPEAT | self._modifiers, self._vk)
         if registered:
             self._registered_hotkey = True
         elif not self._uses_keyboard_hook:
@@ -345,13 +526,15 @@ class HotkeyListener:
         while self._running and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
-        # 消息循环退出：清理
+        # 消息循环退出：清理（必须在本线程做，DestroyWindow 不能跨线程）
         try:
             if self._keyboard_hook:
                 user32.UnhookWindowsHookEx(self._keyboard_hook)
                 self._keyboard_hook = None
             self._keyboard_proc_obj = None
             if self._hwnd:
+                with _LISTENERS_LOCK:
+                    _LISTENERS.pop(self._hwnd, None)
                 if self._registered_hotkey:
                     user32.UnregisterHotKey(self._hwnd, 1)
                     self._registered_hotkey = False
@@ -360,22 +543,28 @@ class HotkeyListener:
         except Exception:
             pass
 
-    def _wndproc(self, hwnd, msg, wparam, lparam):
-        if msg == WM_HOTKEY and wparam == 1:
-            if self.trigger_mode == "toggle":
-                self._pressed = not self._pressed
-                self._press_source = "register" if self._pressed else None
-                if self.on_toggle:
-                    self.on_toggle(self._key_name, self._pressed)
-            else:
-                # hold 模式：按下即时触发（上升沿），无需等待阈值。
-                # 这样"正在录音"气泡在按下瞬间就出现，用户不会误以为没按成功。
-                if not self._pressed:
-                    self._pressed = True
-                    self._press_source = "register"
-                    if self.on_hold_start:
-                        self.on_hold_start(self._key_name)
-        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+    def _on_hotkey_pressed(self):
+        """WM_HOTKEY 命中本 listener 的热键（由进程级窗口过程按 hwnd 派发）。
+
+        `_running` 已在 stop() 时置 False：窗口销毁要等消息循环收尾，这段窗口期
+        里可能还有排队中的 WM_HOTKEY 进来，必须丢掉，否则表现为"停了还在触发"
+        （反复暂停/恢复时尤其明显）。
+        """
+        if not self._running:
+            return
+        if self.trigger_mode == "toggle":
+            self._pressed = not self._pressed
+            self._press_source = "register" if self._pressed else None
+            if self.on_toggle:
+                self.on_toggle(self._key_name, self._pressed)
+        else:
+            # hold 模式：按下即时触发（上升沿），无需等待阈值。
+            # 这样"正在录音"气泡在按下瞬间就出现，用户不会误以为没按成功。
+            if not self._pressed:
+                self._pressed = True
+                self._press_source = "register"
+                if self.on_hold_start:
+                    self.on_hold_start(self._key_name)
 
     def _poll(self):
         """hold 模式：检测热键松开（GetAsyncKeyState）。

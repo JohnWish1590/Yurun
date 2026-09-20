@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from ctypes import wintypes
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -24,8 +25,93 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
 
+def _window_rect(hwnd):
+    """读取目标窗口矩形；失败时返回 None。"""
+    if not hwnd:
+        return None
+    try:
+        rc = wintypes.RECT()
+        if _user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+            return rc.left, rc.top, rc.right, rc.bottom
+    except Exception:
+        pass
+    return None
+
+
+def _monitor_work_area(hwnd):
+    """返回 hwnd 所在显示器的工作区 (left, top, right, bottom)。"""
+    try:
+        from pill import work_area_for_rect
+        return work_area_for_rect(_window_rect(hwnd))
+    except Exception:
+        pass
+    return None
+
+
+def _monitor_work_area_for_point(x, y):
+    """返回坐标所在显示器工作区；用于恢复用户上次拖动的位置。"""
+    try:
+        from pill import work_area_for_rect
+        return work_area_for_rect((int(x), int(y), int(x), int(y)))
+    except Exception:
+        pass
+    return None
+
+
+def _primary_work_area():
+    """主显示器工作区：纠错窗口定位的最终兜底，保证窗口一定落在可见区域。
+
+    不能退回整个虚拟桌面——多显示器（尤其副屏在上方/左侧）时虚拟桌面含负坐标，
+    旧实现正是把窗口放到了 y=-513 这种"合法但用户看不见"的位置。
+    """
+    work = _monitor_work_area_for_point(0, 0)
+    if work:
+        return work
+    try:
+        return 0, 0, _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1)
+    except Exception:
+        return None
+
+
+def _clamp_rect_to_work(x, y, w, h, work):
+    """把窗口左上角收进工作区（四周各留 8px）；工作区比窗口还小则贴左上角。"""
+    l, t, r, b = work
+    min_x, min_y = l + 8, t + 8
+    max_x, max_y = r - w - 8, b - h - 8
+    x = max(min_x, min(x, max_x) if max_x >= min_x else min_x)
+    y = max(min_y, min(y, max_y) if max_y >= min_y else min_y)
+    return int(x), int(y)
+
+
+def _rect_intersects_work(x, y, w, h, work):
+    """窗口矩形与该工作区是否有交集（至少有一部分能被看到）。
+
+    用它而不是"中心点是否在屏内"来判断保存位置是否仍然有效：用户可以把
+    窗口拖到屏幕下缘、标题栏还在屏内但中心点已经出屏，这种位置应当保留，
+    只有像 y=-513 那样与所有显示器完全无重叠的位置才该被丢弃。
+
+    注意 MonitorFromPoint 用的是 MONITOR_DEFAULTTONEAREST，屏幕外的坐标也会
+    返回"最近"显示器的工作区，所以不能只看 work 是否为真。
+    """
+    l, t, r, b = work
+    return x < r and y < b and x + w > l and y + h > t
+
+
+def _clipboard_sequence():
+    """剪贴板序列号（任何程序写入剪贴板都会自增）；不可用时返回 None。
+
+    用来区分"Ctrl+C 真的复制到了选中文字"与"目标应用没响应、读到的是旧剪贴板"。
+    """
+    try:
+        return int(_user32.GetClipboardSequenceNumber())
+    except Exception:
+        return None
+
+
 from config import get_config
-from hotkey import get_hotkey
+from hotkey import (MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, HotkeyListener,
+                    format_hotkey, get_hotkey, hotkey_id, pynput_mod_bit, pynput_vk,
+                    _vk_for)
 from voice_session import VoiceSession
 from logger import (
     get_logger,
@@ -68,11 +154,24 @@ class App:
         # 可选高权限输入助手。存在时只由助手接收主热键和执行输入；
         # 不可用时完整回退到当前单进程热键路径。
         self.privileged_bridge = None
-        # pynput 纠错热键状态（Ctrl+反引号）
+        # 纠错热键（默认 Alt + 反引号，可在设置里自定义）：首选 RegisterHotKey
+        # 监听器，注册失败才回退下面的 pynput 钩子状态。
+        self._correct_hotkey = None
+        # pynput 纠错热键状态 —— 仅作回退路径
         self._kb = None
         self._kb_listener = None
-        self._kb_ctrl = False
+        self._kb_mods = 0                 # 当前按住的修饰键（MOD_* 位掩码）
         self._kb_correct_fired = False
+        # 纠错窗口单例：连续按热键只保留一个窗口，避免多窗口叠加、
+        # 多个剪贴板事务互相覆盖（后开的窗口会把前一个的选区当成"原剪贴板"备份）。
+        self._correction_win = None
+        # 纠错窗口的剪贴板事务：armed=True 表示用户的剪贴板已被 Ctrl+C 覆盖，
+        # 必须在任何退出路径（确认/取消/重建/异常）下还原。
+        self._correction_clip_armed = False
+        self._correction_clip_backup = None
+        # 代际计数：窗口被新窗口取代后，旧窗口已排队的回调（80ms 剪贴板读取、
+        # 220ms 重新置顶）不得再执行，否则会误消费新窗口的剪贴板事务。
+        self._correction_gen = 0
         # 焦点锁定（C1）：录音开始时锁定目标输入控件，切走自动抢回
         self._target_hwnd = None
         self._last_steal = 0.0
@@ -133,30 +232,124 @@ class App:
         self.hotkey.on_error = lambda m: self.ui_q.put(("toast", m))
         self.hotkey.on_toggle = self._on_toggle
 
-    def apply_hotkey_settings(self, key_name, trigger_mode):
-        """立即验证并应用新的主热键/触发方式；失败时自动恢复旧热键。"""
+    def apply_hotkey_settings(self, key_name, trigger_mode, modifiers=0):
+        """立即验证并应用新的主热键/触发方式；失败时自动恢复旧热键。
+
+        modifiers 为 MOD_* 位掩码（0 = 裸键）。主热键在助手连着的时候由**提权
+        助手**注册，所以修饰键必须一起通过 `reconfigure` 传过去，否则助手上仍然
+        是旧的裸键，表现成"设置保存了但热键没变"。
+        """
+        modifiers = int(modifiers or 0)
         if self.privileged_bridge and self.privileged_bridge.connected:
+            # 老版本助手只认裸键，会**静默忽略** modifiers。必须在这里拦住并说明，
+            # 否则用户看到"设置已保存"，实际助手上还是旧组合，表现为热键没变。
+            if modifiers and not self.privileged_bridge.supports("hotkey_modifiers"):
+                log.warning("助手不支持 hotkey_modifiers，拒绝保存组合键主热键")
+                return False, ("后台输入助手版本过旧，无法注册组合键热键。"
+                               "请重新安装语润的高权限输入助手后重试。")
             reply = self.privileged_bridge.request(
-                "reconfigure", {"hotkey": key_name, "trigger_mode": trigger_mode}, timeout=1.2)
+                "reconfigure",
+                {"hotkey": key_name, "trigger_mode": trigger_mode, "modifiers": modifiers},
+                timeout=1.2)
             if reply and reply.get("ok"):
-                log.info("高权限输入助手热键已更新: %s (%s)", key_name, trigger_mode)
+                log.info("高权限输入助手热键已更新: %s (%s)",
+                         format_hotkey(modifiers, key_name), trigger_mode)
                 return True, ""
             return False, "后台输入助手未能更新热键，设置未保存。"
         old_key = self.cfg.get("hotkey") or "`"
         old_mode = self.cfg.get("trigger_mode") or "hold"
+        old_mods = int(self.cfg.get("hotkey_modifiers") or 0)
         self.hotkey.stop()
-        if self.hotkey.start(key_name, trigger_mode):
-            log.info("主热键已即时更新: %s (%s)", key_name, trigger_mode)
+        if self.hotkey.start(key_name, trigger_mode, modifiers):
+            log.info("主热键已即时更新: %s (%s)", format_hotkey(modifiers, key_name), trigger_mode)
             return True, ""
 
         # 新键不可用时，不让应用失去原先可用的录音入口。
         self.hotkey.stop()
-        restored = self.hotkey.start(old_key, old_mode)
+        restored = self.hotkey.start(old_key, old_mode, old_mods)
         if restored:
-            log.warning("新主热键不可用，已恢复: %s (%s)", old_key, old_mode)
+            log.warning("新主热键不可用，已恢复: %s (%s)",
+                        format_hotkey(old_mods, old_key), old_mode)
             return False, "该按键无法注册，已保留原来的热键。"
         log.error("新旧热键均无法注册: new=%s old=%s", key_name, old_key)
         return False, "该按键无法注册，原热键也未能恢复；请重启语润。"
+
+    def apply_correction_hotkey_settings(self, key_name, modifiers):
+        """立即应用新的纠错热键；失败时恢复旧组合，绝不留下"没有纠错入口"的状态。"""
+        modifiers = int(modifiers or 0)
+        old_key, old_mods = self._correction_combo()
+        if self._correct_hotkey is not None:
+            self._correct_hotkey.stop()
+            self._correct_hotkey = None
+        try:
+            listener = HotkeyListener()
+            listener.on_hold_start = self._on_correct_hotkey_fired
+            if listener.start(key_name, "hold", modifiers=modifiers):
+                self._correct_hotkey = listener
+                log.info("纠错热键已即时更新: %s", format_hotkey(modifiers, key_name))
+                return True, ""
+        except Exception as exc:
+            log.warning("纠错热键注册异常: %s", exc)
+
+        # 回滚：用户宁可保留旧组合，也不能没有纠错入口。
+        try:
+            listener = HotkeyListener()
+            listener.on_hold_start = self._on_correct_hotkey_fired
+            if listener.start(old_key, "hold", modifiers=old_mods):
+                self._correct_hotkey = listener
+                log.warning("新纠错热键不可用，已恢复: %s", format_hotkey(old_mods, old_key))
+                return False, "该组合无法注册（可能已被其他程序占用），已保留原来的纠错快捷键。"
+        except Exception:
+            pass
+        log.error("纠错热键新旧组合均无法注册: new=%s old=%s",
+                  format_hotkey(modifiers, key_name), format_hotkey(old_mods, old_key))
+        return False, "该组合无法注册，原纠错快捷键也未能恢复；请重启语润。"
+
+    def set_hotkeys_suspended(self, suspended):
+        """录制快捷键期间临时停用两个热键。
+
+        必须停用：否则用户在设置里按下**当前已生效的组合**时，会真的触发录音
+        或弹出纠错窗口，看起来像"设置界面坏了"。主热键可能注册在**提权助手**
+        里，因此除了本进程的监听器，还要通知助手一起让出。
+        """
+        if suspended:
+            try:
+                if self._correct_hotkey is not None:
+                    self._correct_hotkey.stop()
+                if self._kb_listener is not None:
+                    self._kb_listener.stop()
+                    self._kb_listener = None
+            except Exception as exc:
+                log.debug("暂停纠错热键监听失败: %s", exc)
+            if self.privileged_bridge and self.privileged_bridge.connected:
+                self.privileged_bridge.request("suspend", {"on": True}, timeout=0.8)
+            else:
+                try:
+                    self.hotkey.stop()
+                except Exception as exc:
+                    log.debug("暂停主热键失败: %s", exc)
+            log.info("快捷键录制开始，已临时停用热键")
+            return
+
+        if self.privileged_bridge and self.privileged_bridge.connected:
+            self.privileged_bridge.request("suspend", {"on": False}, timeout=0.8)
+        else:
+            key = self.cfg.get("hotkey") or "`"
+            mode = self.cfg.get("trigger_mode") or "hold"
+            mods = int(self.cfg.get("hotkey_modifiers") or 0)
+            try:
+                self.hotkey.start(key, mode, mods)
+            except Exception as exc:
+                log.warning("恢复主热键失败: %s", exc)
+        key, mods = self._correction_combo()
+        try:
+            listener = HotkeyListener()
+            listener.on_hold_start = self._on_correct_hotkey_fired
+            if listener.start(key, "hold", modifiers=mods):
+                self._correct_hotkey = listener
+        except Exception as exc:
+            log.warning("恢复纠错热键失败: %s", exc)
+        log.info("快捷键录制结束，热键已恢复")
 
     def _is_active_session(self, round_id):
         """只有最新语音轮次可以更新浮窗或执行输入；None 是非会话 UI 事件。"""
@@ -165,7 +358,7 @@ class App:
     def _event_round_id(self, evt):
         """提取会话事件携带的 round_id；兼容非会话 UI 事件。"""
         kind = evt[0]
-        if kind in {"recording", "transcribing", "refining", "done", "stream_insert_done"}:
+        if kind in {"recording", "transcribing", "retrying", "refining", "done", "stream_insert_done"}:
             return evt[1] if len(evt) > 1 else None
         if kind in {"error", "type_partial", "partial_preview"}:
             return evt[2] if len(evt) > 2 else None
@@ -240,6 +433,9 @@ class App:
                 # 松手后、ASR 等待期间：显示「正在识别」（苹果蓝麦克风），
                 # 不再误显「正在录音」，避免"框凭空跳出来"的错觉。
                 self.indicator.show_transcribing()
+            elif kind == "retrying":
+                # 仅当已松手且完整最终结果丢失时触发一次；不把 partial 当作输入。
+                self.indicator.show_retrying()
             elif kind == "refining":
                 self.indicator.show_refining()
             elif kind in ("done", "fallback"):
@@ -259,7 +455,8 @@ class App:
             elif kind == "toast":
                 self.indicator.show_error(evt[1])
             elif kind == "show_correction":
-                self._show_correction_dialog()
+                log.info("纠错窗口 UI 事件开始")
+                self._show_correction_dialog(evt[1] if len(evt) > 1 else None)
             elif kind == "bridge_hotkey":
                 self._handle_privileged_hotkey(evt[1] if len(evt) > 1 else {})
             elif kind == "model_loading":
@@ -513,9 +710,89 @@ class App:
             self._on_hold_end(None)
 
     def _on_correct_key(self, _key):
-        """纠错热键（Ctrl+反引号）触发：转主线程弹「错误纠正」框。"""
+        """纠错热键（左 Alt + 反引号）触发：转主线程弹「错误纠正」框。"""
         log.info("纠错热键触发")
-        self.ui_q.put(("show_correction", None))
+        # 在后台热键线程立刻记住目标窗口；不要等 Tk 队列稍后处理时再取前台窗口，
+        # 否则 Cindy 等应用可能已经短暂失焦，导致选区和定位对象不对。
+        try:
+            target_hwnd = _user32.GetForegroundWindow()
+        except Exception:
+            target_hwnd = None
+        self.ui_q.put(("show_correction", target_hwnd))
+        log.info("纠错窗口请求已进入 UI 队列")
+
+    def _on_correct_hotkey_fired(self, _key=None):
+        """RegisterHotKey 路径的纠错热键回调（热键消息线程）。
+
+        **不再区分左右 Alt**（用户 2026-09-20 决策："不区分，是 Alt 就算"）。
+        `RegisterHotKey` 的 `MOD_ALT` 本来就不区分左右，事后想区分只能靠
+        `GetAsyncKeyState`，而它在**提权前台窗口**（Cindy）下对非提权进程一律
+        返回 0 —— 旧实现正是在这里把按键静默丢弃（实测 Cindy 里连按 5 次全被
+        忽略、WorkBuddy 下同一按键正常）。既然关键时刻读不到，就统一按 Alt
+        处理，代价是右 Alt 也会触发。
+        """
+        self._on_correct_key(None)
+
+    def _correction_combo(self):
+        """返回配置里的纠错热键 (键名, 修饰位)。缺字段时回落 Alt+`。"""
+        key = self.cfg.get("correction_hotkey") or "`"
+        mods = self.cfg.get("correction_hotkey_modifiers")
+        if mods is None:
+            mods = MOD_ALT
+        try:
+            mods = int(mods)
+        except (TypeError, ValueError):
+            mods = MOD_ALT
+        return key, mods
+
+    def _start_correct_hotkey(self):
+        """注册纠错热键（默认 Alt + 反引号；可在设置里自定义）。
+
+        必须走 RegisterHotKey，不能用键盘钩子：非提权进程的低层键盘钩子
+        （pynput / WH_KEYBOARD_LL）在**提权窗口**获得焦点时收不到按键。
+        实测（Cindy 提权焦点下按左Alt+`）：
+            RegisterHotKey  命中 9/9 次
+            pynput 钩子     命中 0/9 次
+        这正是主热键要交给提权助手接管、而纠错热键在 Cindy 里"没反应"的原因。
+        RegisterHotKey 由系统在输入处理阶段匹配，与前台窗口的完整性级别无关，
+        所以"抓住按键"不需要提权（把文字注入提权窗口才需要助手）。
+
+        注：v0.1.17 记录过"第二热键注册失败"，当时注册的是**裸**反引号，
+        与主热键是同一个组合，必然冲突；默认的 Alt+` 与裸反引号是两个不同
+        组合，可以共存（用户自定义后由设置界面负责查重）。
+        """
+        key, mods = self._correction_combo()
+        try:
+            listener = HotkeyListener()
+            listener.on_hold_start = self._on_correct_hotkey_fired
+            if listener.start(key, "hold", modifiers=mods):
+                self._correct_hotkey = listener
+                log.info("纠错热键监听已启动: %s（RegisterHotKey，提权窗口下亦可捕获）",
+                         format_hotkey(mods, key))
+                return
+            log.warning("纠错热键 RegisterHotKey 注册失败，回退 pynput 钩子")
+        except Exception as exc:
+            log.warning("纠错热键注册异常，回退 pynput 钩子: %s", exc)
+        self._start_correct_hotkey_pynput()
+
+    def _start_correct_hotkey_pynput(self):
+        """回退路径：pynput 低层钩子。
+
+        ⚠️ 仅在**非提权**前台窗口下有效。若前台是提权窗口（如 Cindy），
+        钩子收不到按键，纠错热键会表现为"完全没反应"。
+        """
+        try:
+            from pynput import keyboard as _kb
+            self._kb = _kb
+            self._kb_listener = _kb.Listener(
+                on_press=self._kb_on_press, on_release=self._kb_on_release)
+            self._kb_listener.daemon = True
+            self._kb_listener.start()
+            key, mods = self._correction_combo()
+            log.info("纠错热键监听已启动: %s（pynput 回退；提权窗口下不可用）",
+                     format_hotkey(mods, key))
+        except Exception as e:
+            log.warning("pynput 纠错热键监听启动失败: %s", e)
 
     def _pill_anchor(self):
         """返回 pill 气泡当前屏幕矩形 (l, t, r, b)；拿不到返回 None。"""
@@ -557,6 +834,32 @@ class App:
         except Exception as e:
             log.warning("自动 Ctrl+C 失败: %s", e)
 
+    def _privileged_copy_selection(self, hwnd) -> bool:
+        """请提权助手把 hwnd 的选中文字复制到剪贴板。
+
+        非提权进程做不到这一步，两个原因叠加：`SetForegroundWindow` 无法把
+        提权窗口设为前台；即使焦点对，`SendInput` 也会被 UIPI 拦下。实测在
+        Cindy 里表现为「纠错选中文本未取到（剪贴板序列号未变化）」，而
+        WorkBuddy 等普通权限程序一直正常。
+
+        助手提权执行「置前 + Ctrl+C」后，剪贴板内容仍由本进程读取 ——
+        跨完整性级别**读**剪贴板是允许的。
+        返回 True 表示 Ctrl+C 已由助手发出，调用方照原流程读剪贴板即可。
+        """
+        bridge = self.privileged_bridge
+        if bridge is None or not bridge.connected:
+            return False
+        try:
+            reply = bridge.copy_selection(int(hwnd))
+        except Exception as exc:
+            log.warning("高权限复制选区请求失败，回退普通路径: %s", exc)
+            return False
+        if not reply or not reply.get("ok"):
+            log.info("高权限复制选区未成功，回退普通路径: %s", reply)
+            return False
+        log.info("高权限复制选区完成（Ctrl+C 由提权助手发出）")
+        return True
+
     def _replace_correction_selection(self, correct, target_hwnd):
         """将弹窗打开前的选区替换为 correct，并恢复用户原有剪贴板文本。"""
         if not correct or not target_hwnd:
@@ -579,44 +882,154 @@ class App:
             log.warning("纠正替换当前选区失败: %s", exc)
             return False
 
-    def _kb_on_press(self, key):
-        """pynput 钩子（后台线程）：Ctrl+反引号 → 纠错弹窗。防重复触发。
+    def _correction_clipboard_arm(self):
+        """进入纠错窗口的剪贴板事务：先记下用户原有剪贴板内容。"""
+        self._correction_clip_backup = self._clipboard_backup()
+        self._correction_clip_armed = True
 
-        用 vk（虚拟键码 0xC0）判断反引号键：char 受键盘布局/输入法影响
-        （中文输入法下反引号键 char 可能是「·」而非「`」），vk 恒定可靠。
+    def _correction_clipboard_restore(self):
+        """还原用户剪贴板；幂等，窗口确认/取消/重建/异常各路径都要调用。"""
+        if not self._correction_clip_armed:
+            return
+        self._correction_clip_armed = False
+        self._clipboard_restore(self._correction_clip_backup)
+        self._correction_clip_backup = None
+
+    def _correction_geometry(self, W2, H2, selection_hwnd):
+        """决定纠错窗口左上角坐标，返回 (x, y, source, work_area)。
+
+        降级顺序：上次拖动位置 → 热键触发时的目标窗口 → 主显示器中央。
+        每一步都校验落点属于某个显示器工作区，最后再强制收进工作区，
+        保证窗口不会像旧实现那样停在可见区域之外（曾出现 y=-513）。
+        """
+        # 1) 用户上次拖动的位置（仍落在某个显示器工作区内才恢复）
+        try:
+            saved = self.cfg.get("correction_window_position")
+        except Exception:
+            saved = None
+        if isinstance(saved, dict):
+            sx = sy = None
+            try:
+                sx, sy = int(saved["x"]), int(saved["y"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            if sx is not None:
+                cx, cy = sx + W2 // 2, sy + H2 // 2
+                work = _monitor_work_area_for_point(cx, cy)
+                # 必须确认窗口与该显示器还有重叠。屏幕外的坐标也会拿到"最近"
+                # 显示器的工作区，只判 work 真假会把 y=-513 当成有效位置，
+                # 窗口被 clamp 后粘在屏幕边缘，用户很难看出它其实"没恢复到原位"。
+                if work and _rect_intersects_work(sx, sy, W2, H2, work):
+                    x, y = _clamp_rect_to_work(sx, sy, W2, H2, work)
+                    return x, y, "saved", work
+                if work:
+                    log.info("纠错窗口保存位置已不在任何显示器内，改用当前目标窗口")
+
+        # 2) 依次尝试 目标窗口 → 焦点窗口 → pill 锚点，取第一个有效矩形。
+        #    注意 _focus_rect 在 GetWindowRect 失败时返回的是全 0 矩形（不是 None），
+        #    必须显式跳过无效矩形，否则后面的 pill 锚点永远没有机会被用到。
+        candidates = []
+        try:
+            target_rect = _window_rect(selection_hwnd)
+        except Exception as exc:
+            log.debug("纠错窗口读取目标窗口失败: %s", exc)
+            target_rect = None
+        if target_rect:
+            candidates.append(("target_window", target_rect))
+        try:
+            from pill import _focus_rect
+            focus_rect = _focus_rect(selection_hwnd)
+        except Exception:
+            focus_rect = None
+        if focus_rect:
+            candidates.append(("focus_rect", focus_rect))
+        try:
+            pill_rect = self._pill_anchor()
+        except Exception:
+            pill_rect = None
+        if pill_rect:
+            candidates.append(("anchor", pill_rect))
+
+        for name, rect in candidates:
+            pl, pt, pr, pb = rect
+            if pr <= pl or pb <= pt:
+                continue
+            work = (_monitor_work_area_for_point((pl + pr) // 2, (pt + pb) // 2)
+                    or _primary_work_area())
+            if not work:
+                continue
+            x, y = _clamp_rect_to_work(
+                (pl + pr) // 2 - W2 // 2, pt - H2 - 12, W2, H2, work)
+            return x, y, name, work
+
+        # 3) 兜底：主显示器工作区，保证窗口一定可见
+        work = _primary_work_area() or (0, 0, W2, H2)
+        x, y = _clamp_rect_to_work((work[0] + work[2] - W2) // 2,
+                                   (work[1] + work[3] - H2) // 3,
+                                   W2, H2, work)
+        return x, y, "primary_fallback", work
+
+    def _kb_on_press(self, key):
+        """pynput 钩子（后台线程）：配置的纠错热键 → 纠错弹窗。防重复触发。
+
+        用 vk（虚拟键码）判断主键：char 受键盘布局/输入法影响（中文输入法下
+        反引号键的 char 可能是「·」而非「`」），vk 恒定可靠。
+        修饰键要求**精确匹配**配置值：配了 Alt+` 时按 Ctrl+Alt+` 不会触发。
         """
         try:
-            kb = self._kb
-            if key in (kb.Key.ctrl_l, kb.Key.ctrl_r):
-                self._kb_ctrl = True
+            bit = pynput_mod_bit(key)
+            if bit:
+                self._kb_mods |= bit
                 return
-            if self._kb_ctrl and not self._kb_correct_fired:
-                if getattr(key, "vk", None) == 0xC0:
-                    self._kb_correct_fired = True
-                    self._on_correct_key(None)
+            if self._kb_correct_fired:
+                return
+            target_key, target_mods = self._correction_combo()
+            if self._kb_mods == target_mods and pynput_vk(key) == _vk_for(target_key):
+                self._kb_correct_fired = True
+                self._on_correct_key(None)
         except Exception:
             pass
 
     def _kb_on_release(self, key):
         try:
-            kb = self._kb
-            if key in (kb.Key.ctrl_l, kb.Key.ctrl_r):
-                self._kb_ctrl = False
-            elif getattr(key, "vk", None) == 0xC0:
+            bit = pynput_mod_bit(key)
+            if bit:
+                self._kb_mods &= ~bit
+                return
+            target_key, _mods = self._correction_combo()
+            if pynput_vk(key) == _vk_for(target_key):
                 self._kb_correct_fired = False
         except Exception:
             pass
 
     # ================= 纠错弹窗（词库学习入口） =================
-    def _show_correction_dialog(self):
+    def _show_correction_dialog(self, target_hwnd=None):
         """「错误纠正」弹窗：macOS/Apple 浅色风格（稳定 pack 布局版）。
 
         位置：贴 pill 气泡正上方 12px（水平居中于 pill）。B1 识别文本自动读
         选中文字（方案A：备份剪贴板 → Ctrl+C → 读选中 → 恢复剪贴板），打开时
         聚焦"正确写法"。
         """
+        # 单例：连续按热键只保留一个纠错窗口。旧窗口先安全收尾（还原它持有的
+        # 剪贴板备份），再建新窗口，避免多窗口叠加、多个剪贴板事务互相覆盖
+        # （后开的窗口会把前一个窗口复制进剪贴板的选区当成"用户原剪贴板"）。
+        prev = self._correction_win
+        if prev is not None:
+            try:
+                if prev.winfo_exists():
+                    log.info("纠错窗口已存在，先关闭旧窗口再重建")
+                    prev.destroy()
+            except Exception as exc:
+                log.debug("关闭旧纠错窗口失败: %s", exc)
+            self._correction_win = None
+            self._correction_clipboard_restore()
+
+        # 本轮窗口的代际号：旧窗口残留的回调靠它识别自己已经过期。
+        self._correction_gen += 1
+        my_gen = self._correction_gen
+
         from gui import TEXT, TEXT_DIM, ACCENT, FONT, PillButton
-        from pill import TRANSPARENT, _round_rect_items
+        from pill import TRANSPARENT, _round_rect_items, _focus_rect
 
         try:
             from dictionary import add_entry
@@ -627,9 +1040,18 @@ class App:
 
         # 在创建弹窗前保存原应用窗口；确认时只把已选中的原文字替换掉。
         try:
-            selection_hwnd = _user32.GetForegroundWindow()
+            selection_hwnd = target_hwnd or _user32.GetForegroundWindow()
         except Exception:
-            selection_hwnd = None
+            selection_hwnd = target_hwnd
+        try:
+            title_buf = ctypes.create_unicode_buffer(256)
+            _user32.GetWindowTextW(selection_hwnd, title_buf, len(title_buf))
+            class_buf = ctypes.create_unicode_buffer(128)
+            _user32.GetClassNameW(selection_hwnd, class_buf, len(class_buf))
+            log.info("纠错目标窗口: hwnd=%s title=%r class=%r", selection_hwnd,
+                     title_buf.value, class_buf.value)
+        except Exception:
+            pass
 
         win = tk.Toplevel(self.root)
         win.withdraw()
@@ -649,21 +1071,75 @@ class App:
         wrong_var = tk.StringVar()
         correct_var = tk.StringVar()
         status_var = tk.StringVar()
+        selected_text = ""
 
-        # B1+方案A：自动复制选中（备份剪贴板 → Ctrl+C → 读选中 → 恢复剪贴板）
-        # 此时弹窗仍 withdraw、焦点在外部 app，Ctrl+C 才能取到选中文字
-        try:
-            _backup = self._clipboard_backup()
-            self._send_ctrl_c()
-            time.sleep(0.08)
-            _sel = self.root.clipboard_get()
-        except Exception:
-            _sel = ""
-        finally:
-            self._clipboard_restore(_backup)
-        selected_text = (_sel or "").strip()
-        if selected_text:
-            wrong_var.set(selected_text[:120])
+        # B1+方案A：仍然自动复制选中内容，但不再让剪贴板读取决定窗口
+        # 是否能显示。Cindy 等应用的剪贴板响应可能延迟或暂时无响应；窗口
+        # 先出现，读取在窗口可见后进行，失败时只影响“识别文本”自动填充。
+        def _finish_selection_capture(seq_before, refocus=False):
+            nonlocal selected_text
+            if my_gen != self._correction_gen:
+                # 本窗口已被新窗口取代，剪贴板事务也已由新窗口接管，
+                # 这里再动剪贴板会把新窗口的备份状态消费掉。
+                return
+            try:
+                # 剪贴板序列号没变，说明 Ctrl+C 没真正写入剪贴板（目标未响应
+                # 或焦点没切过去），此时读到的是旧内容，不能当成用户选中的文字。
+                seq_after = _clipboard_sequence()
+                if (seq_before is not None and seq_after is not None
+                        and seq_before == seq_after):
+                    log.info("纠错选中文本未取到（剪贴板序列号未变化）")
+                else:
+                    _sel = self.root.clipboard_get()
+                    selected_text = (_sel or "").strip()
+                    if selected_text:
+                        wrong_var.set(selected_text[:120])
+                        log.info("纠错选中文本读取完成: length=%s", len(selected_text))
+                        # 文本变长会让「识别文本」标签换行、需求高度变大，
+                        # 必须重新布局，否则底部按钮会被裁掉。
+                        _reflow()
+                    else:
+                        log.info("纠错选中文本为空")
+            except Exception as exc:
+                log.warning("纠错选中文本读取失败，仍保留纠错窗口: %s", exc)
+            finally:
+                self._correction_clipboard_restore()
+            if refocus:
+                # 走的是助手置前路径：目标窗口刚被拉到前台，得把纠错窗口拉回来，
+                # 否则用户接着在「正确写法」里打字会打不进。与 220ms 的
+                # _focus_correction_window 同效，只是补一次防止 IPC 慢时错过。
+                try:
+                    if win.winfo_exists():
+                        win.lift()
+                        win.attributes("-topmost", True)
+                        win.focus_force()
+                except Exception as exc:
+                    log.debug("纠错窗口重新置前失败: %s", exc)
+
+        def _capture_selection_after_show():
+            if my_gen != self._correction_gen:
+                return
+            log.info("纠错窗口已显示，开始读取选中文本")
+            seq_before = None
+            copied_by_helper = False
+            try:
+                self._correction_clipboard_arm()
+                seq_before = _clipboard_sequence()
+                # 首选提权助手：目标若是提权程序（Cindy 等），只有助手能把它
+                # 置前并发 Ctrl+C —— 非提权进程这两步都会被系统拦掉。
+                if selection_hwnd:
+                    copied_by_helper = self._privileged_copy_selection(selection_hwnd)
+                if not copied_by_helper:
+                    # 回退：普通权限路径（WorkBuddy / ChatGPT 等一直走这里）。
+                    # 目标窗口仍由 selection_hwnd 标识；必要时短暂恢复其前台，
+                    # 确保 Ctrl+C 不会复制到纠错窗口自身。
+                    if selection_hwnd:
+                        self._steal_focus(selection_hwnd)
+                    self._send_ctrl_c()
+            except Exception as exc:
+                log.warning("纠错选区复制失败，仍保留空白识别文本: %s", exc)
+            # 给目标应用一个很短的时间写入剪贴板；不在 Tk 主线程 sleep。
+            win.after(80, lambda: _finish_selection_capture(seq_before, copied_by_helper))
 
         # 圆角白底：canvas 用 place 铺满窗口作背景画圆角白底，body 不透明白底内缩
         # 8px 浮在上层。中间完全不透明遮住背后内容，外圈 8px 露出 canvas 圆角白底
@@ -676,24 +1152,125 @@ class App:
         # 中间完全不透、遮住背后文字；外圈 8px 露出 canvas 圆角白底形成圆角边框。
         body.place(x=8, y=8, width=W2 - 16, height=10)
 
-        # 窗口尺寸定好后画圆角白底（铺满，四角透明）
-        def _draw_bg():
-            w = win.winfo_width()
-            h = win.winfo_height()
-            if w <= 1 or h <= 1:
-                win.after(10, _draw_bg)
-                return
-            canvas.configure(width=w, height=h)
-            _round_rect_items(canvas, 0, 0, w, h, 18, "#FFFFFF")
-            # 把 canvas 降到 body 之下。tk.Canvas.lower 是 tag_lower 别名（必须带
-            # tagOrId），无参会 TclError；用 widget 级 lower 命令绕过别名。
-            canvas.tk.call('lower', canvas._w)
+        # 窗口尺寸定好后画圆角白底（铺满，四角透明）。
+        # 显式接受尺寸：窗口在 deiconify 之前 winfo_width() 还是 1，而定位流程
+        # 此时已知确切的 W2/H2，不必再靠轮询等待窗口映射。
+        def _draw_bg(w=None, h=None):
+            try:
+                if w is None or h is None:
+                    w, h = win.winfo_width(), win.winfo_height()
+                if w <= 1 or h <= 1:
+                    return
+                canvas.configure(width=w, height=h)
+                _round_rect_items(canvas, 0, 0, w, h, 18, "#FFFFFF")
+                # 把 canvas 降到 body 之下。tk.Canvas.lower 是 tag_lower 别名（必须带
+                # tagOrId），无参会 TclError；用 widget 级 lower 命令绕过别名。
+                canvas.tk.call('lower', canvas._w)
+            except Exception as exc:
+                log.debug("纠错窗口背景绘制失败: %s", exc)
 
-        win.after(20, _draw_bg)
+        H2_DEFAULT = 490   # 高度算不出来时的兜底值
+
+        def _measure_height():
+            """按当前内容求窗口总高（含上下各 8px 内缩的圆角边框）。"""
+            try:
+                win.update_idletasks()
+                h = body.winfo_reqheight() + 16
+                # 布局尚未完成时 winfo_reqheight 可能是异常小值，不能直接用
+                return h if h > 120 else H2_DEFAULT
+            except Exception as exc:
+                log.warning("纠错窗口高度计算失败，使用默认高度: %s", exc)
+                return H2_DEFAULT
+
+        def _apply_size(px, py, h):
+            """把窗口摆到 (px, py) 并设为 W2×h，同步 body 与圆角背景。"""
+            try:
+                win.geometry(f"{W2}x{int(h)}+{int(px)}+{int(py)}")
+                body.place_configure(width=W2 - 16, height=int(h) - 16)
+            except Exception as exc:
+                log.error("纠错窗口几何设置失败: %s", exc)
+            _draw_bg(W2, h)
+
+        def _reflow():
+            """内容变化后重算高度并重新摆放。
+
+            识别文本是窗口显示之后才异步填入的：填入长文本会让「识别文本」
+            标签换行、需求高度明显变大。body 用 place 且高度是写死的，不会
+            自己撑高，所以不再算一次就会把底部按钮裁掉——这正是"复制的字
+            太多时下面的按钮没了"的原因。
+            """
+            h = _measure_height()
+            try:
+                cur_x, cur_y = win.winfo_x(), win.winfo_y()
+            except Exception:
+                cur_x, cur_y = 0, 0
+            try:
+                # 高度没变就不重排，避免无谓的重绘和视觉跳动。
+                if abs(win.winfo_height() - h) < 2:
+                    log.debug("纠错窗口高度未变化（%s），跳过重排", h)
+                    return h
+            except Exception:
+                pass
+            work = (_monitor_work_area_for_point(cur_x + W2 // 2, cur_y + h // 2)
+                    or _primary_work_area())
+            if work:
+                # 长文本可能把窗口撑得比工作区还高：先限高，再整体收进工作区，
+                # 保证按钮那一行始终留在屏幕内。
+                max_h = work[3] - work[1] - 16
+                if 0 < max_h < h:
+                    log.debug("纠错窗口高度 %s 超过工作区，限制为 %s", h, max_h)
+                    h = max_h
+                cur_x, cur_y = _clamp_rect_to_work(cur_x, cur_y, W2, h, work)
+            _apply_size(cur_x, cur_y, h)
+            return h
 
         # ===== Header（兼作拖动把手：overrideredirect 无标题栏，需手动绑拖拽）=====
         header = tk.Frame(body, bg="#FFFFFF", cursor="fleur")
         header.pack(fill="x", padx=PAD, pady=(PAD, 0))
+
+        _position_save_after = None
+
+        def _remember_position():
+            """保存用户拖动后的坐标，供下次打开优先恢复。"""
+            nonlocal _position_save_after
+            _position_save_after = None
+            try:
+                x, y = win.winfo_x(), win.winfo_y()
+                self.cfg.set("correction_window_position", {"x": int(x), "y": int(y)})
+                log.info("纠错窗口位置已保存: x=%s y=%s", x, y)
+            except Exception as exc:
+                log.debug("保存纠错窗口位置失败: %s", exc)
+
+        def _schedule_remember_position():
+            nonlocal _position_save_after
+            if _position_save_after:
+                try:
+                    win.after_cancel(_position_save_after)
+                except Exception:
+                    pass
+            _position_save_after = win.after(220, _remember_position)
+
+        def _close_correction_window():
+            if my_gen != self._correction_gen:
+                # 已被新窗口取代：不能再写共享状态（位置/剪贴板/单例引用），
+                # 否则会用旧窗口的坐标和事务覆盖掉新窗口的。
+                try:
+                    if win.winfo_exists():
+                        win.destroy()
+                except Exception as exc:
+                    log.debug("销毁过期纠错窗口失败: %s", exc)
+                return
+            _remember_position()
+            # 窗口可能在任何时刻关闭（用户按 Esc / 点取消 / 被单例重建顶掉）。
+            # 必须在这里还原用户剪贴板：排队中的读取回调会随窗口销毁而不再执行，
+            # 否则用户剪贴板会被永久留在"被 Ctrl+C 覆盖过"的状态。
+            self._correction_clipboard_restore()
+            self._correction_win = None
+            try:
+                if win.winfo_exists():
+                    win.destroy()
+            except Exception as exc:
+                log.debug("销毁纠错窗口失败: %s", exc)
 
         def _drag_start(e):
             win._drag_x = e.x_root - win.winfo_x()
@@ -701,6 +1278,7 @@ class App:
 
         def _drag_move(e):
             win.geometry(f"+{e.x_root - win._drag_x}+{e.y_root - win._drag_y}")
+            _schedule_remember_position()
 
         header.bind("<ButtonPress-1>", _drag_start)
         header.bind("<B1-Motion>", _drag_move)
@@ -757,7 +1335,7 @@ class App:
                             len(wrong), len(correct))
             else:
                 status_var.set(f"已存入词库：{correct}")
-            win.after(1200, win.destroy)
+            win.after(1200, _close_correction_window)
 
         footer = tk.Frame(body, bg="#FFFFFF")
         footer.pack(fill="x", padx=PAD, pady=(0, PAD))
@@ -768,38 +1346,58 @@ class App:
         # 占位 spacer 把按钮推到右侧；pack 顺序：先 right 的会后出现，因此先 pack 存入词库（最右），再 pack 取消（左侧）
         tk.Frame(footer, bg="#FFFFFF").pack(side="left", fill="x", expand=True)
         PillButton(footer, "替换并存入词库", _confirm, primary=True, min_w=150).pack(side="right")
-        PillButton(footer, "取消", lambda: win.destroy(), primary=False,
+        PillButton(footer, "取消", _close_correction_window, primary=False,
                    weight="normal", min_w=90).pack(side="right", padx=(0, 12))
 
-        # 位置计算必须在 body 渲染后
-        def _place():
-            win.update_idletasks()
-            H2 = body.winfo_reqheight() + 16   # 上下各 8px 内缩，给圆角白底边框
-            rect = self._pill_anchor()
-            if rect:
-                pl, pt, pr, pb = rect
-                pill_cx = (pl + pr) // 2
-                x = pill_cx - W2 // 2
-                y = pt - H2 - 12
-            else:
-                sw = win.winfo_screenwidth()
-                sh = win.winfo_screenheight()
-                x = (sw - W2) // 2
-                y = max(60, (sh - H2) // 3)
-            y = max(8, y)
-            win.geometry(f"{W2}x{H2}+{x}+{y}")
-            body.place_configure(width=W2 - 16, height=H2 - 16)
-            _draw_bg()
+        # ===== 定位与显示：先在隐藏状态下算好尺寸和坐标，再一次性显示 =====
+        # 旧实现先 win.deiconify()、30ms 后才跑 _place()：窗口会先用 Tk 默认
+        # geometry 出现在未定位的（可能屏幕外）位置；一旦 _place 中途抛错，
+        # 窗口就永远留在那里，表现成"按了热键却看不见窗口"（Cindy 场景下的
+        # 主要故障形态）。现在改为：算高度 → 定坐标 → 设 geometry → 才显示。
+        H2 = _measure_height()
 
-        win.after(30, _place)
+        try:
+            x, y, source, work = self._correction_geometry(W2, H2, selection_hwnd)
+        except Exception as exc:
+            # 定位兜底本身也失败时，至少把窗口放到主显示器左上角，绝不留在屏幕外。
+            log.error("纠错窗口定位异常，回退主屏: %s", exc)
+            work = _primary_work_area() or (0, 0, W2, H2)
+            x, y, source = work[0] + 40, work[1] + 40, "error_fallback"
 
-        # 打开时聚焦正确写法
-        win.after(80, lambda: e2.focus_set())
+        log.info("纠错窗口定位: source=%s work_area=(%s,%s,%s,%s) x=%s y=%s w=%s h=%s",
+                 source, work[0], work[1], work[2], work[3], x, y, W2, H2)
+
+        _apply_size(x, y, H2)
+
+        # 打开时聚焦正确写法；留出选区复制/读取时间，避免焦点过早回到弹窗。
+        def _focus_correction_window():
+            try:
+                # 再执行一次显示与置顶：若上面首次 deiconify 因异常未生效，
+                # 这里是最后一次补救机会（窗口已显示时 deiconify 是空操作）。
+                win.deiconify()
+                win.lift()
+                win.attributes("-topmost", True)
+                win.focus_force()
+                e2.focus_set()
+            except Exception as exc:
+                log.debug("纠错窗口重新置顶失败: %s", exc)
+        win.after(220, _focus_correction_window)
 
         e2.bind("<Return>", lambda _e: _confirm())
-        win.bind("<Escape>", lambda _e: win.destroy())
-        win.deiconify()
-        win.lift()
+        win.bind("<Escape>", lambda _e: _close_correction_window())
+
+        # 尺寸与位置都已确定，窗口第一次出现就落在正确位置。
+        try:
+            win.deiconify()
+            win.lift()
+            win.attributes("-topmost", True)
+            win.focus_force()
+        except Exception as exc:
+            log.error("纠错窗口显示失败: %s", exc)
+        log.info("纠错窗口已显示")
+        self._correction_win = win
+        # 先显示窗口，再做自动读取；即使 Cindy 的剪贴板卡住，用户仍能手动填写。
+        win.after(10, _capture_selection_after_show)
 
     # ================= 录音→转写→润色→粘贴 =================
     def _record_job(self, session):
@@ -882,6 +1480,7 @@ class App:
                 hotwords=to_hotwords(),
                 on_partial=lambda t: self.ui_q.put(("partial_preview", t, round_id)),
                 on_timeline=lambda m, t: session.timeline.__setitem__(m, t),
+                on_retry=lambda _reason: self.ui_q.put(("retrying", round_id)),
             )
             self._log_timeline(session.timeline, round_id)
         except Exception as e:
@@ -1635,6 +2234,18 @@ class App:
         except Exception:
             pass
         try:
+            if self._correct_hotkey:
+                self._correct_hotkey.stop()
+                self._correct_hotkey = None
+        except Exception:
+            pass
+        try:
+            if self._kb_listener:
+                self._kb_listener.stop()
+                self._kb_listener = None
+        except Exception:
+            pass
+        try:
             self.tray.stop()
         except Exception:
             pass
@@ -1727,22 +2338,16 @@ class App:
         except Exception as exc:
             log.debug("高权限输入助手连接跳过: %s", exc)
         if self.privileged_bridge is None:
-            ok = self.hotkey.start(self.cfg.get("hotkey"), self.cfg.get("trigger_mode", "hold"))
+            ok = self.hotkey.start(self.cfg.get("hotkey"),
+                                   self.cfg.get("trigger_mode", "hold"),
+                                   int(self.cfg.get("hotkey_modifiers") or 0))
             if not ok:
                 self.ui_q.put(("toast", "热键无效"))
-        # 纠错热键：Ctrl+反引号 —— 用 pynput 全局键盘钩子监听（不依赖 RegisterHotKey：
-        # v0.1.17 实测第二热键注册失败且真实错误码被掩盖，pynput 钩子稳定可控；
-        # 且实测无修饰反引号热键在带 Ctrl 时不会误触发录音，两键位共存安全）
-        try:
-            from pynput import keyboard as _kb
-            self._kb = _kb
-            self._kb_listener = _kb.Listener(
-                on_press=self._kb_on_press, on_release=self._kb_on_release)
-            self._kb_listener.daemon = True
-            self._kb_listener.start()
-            log.info("纠错热键监听已启动: Ctrl+`（pynput）")
-        except Exception as e:
-            log.warning("pynput 纠错热键监听启动失败: %s", e)
+        # 纠错热键：默认 Alt + 反引号（可在设置里自定义）—— 首选 RegisterHotKey
+        # （理由与实测数据见 _start_correct_hotkey 的注释：提权前台窗口下钩子
+        # _start_correct_hotkey 的注释：提权前台窗口下钩子收不到按键）；
+        # 注册被占用时才回退 pynput 钩子。
+        self._start_correct_hotkey()
         # 先在主线程提交托盘，再进入 Tk mainloop。run_detached 会自行管理
         # Windows 的托盘消息循环；不要再额外套一层后台线程。
         self.tray.start(APP_TITLE)

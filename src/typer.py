@@ -15,6 +15,10 @@ INPUT_KEYBOARD = 1
 KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_KEYUP = 0x0002
 VK_RETURN = 0x0D
+VK_CONTROL = 0x11
+VK_C = 0x43
+VK_MENU = 0x12
+KEYEVENTF_EXTENDEDKEY = 0x0001
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -126,4 +130,25 @@ def type_text(text: str, chunk_pause: float = 0.0, char_interval: float = 0.0, o
     sent = _user32.SendInput(n, ctypes.cast(arr, ctypes.POINTER(INPUT)), ctypes.sizeof(INPUT))
     if sent != n:
         log.warning("SendInput 仅投递 %d/%d 个事件", sent, n)
+    return sent
+
+
+def send_ctrl_c() -> int:
+    """发送一次 Ctrl+C，把目标窗口的选中文字送入剪贴板。
+
+    由**提权助手**调用：非提权进程的 SendInput 会被 UIPI 拦下，因此只有提权
+    进程才能把提权程序（Cindy 等）的选区复制出来。返回实际投递的事件数，
+    4 表示完整发出（Ctrl↓ C↓ C↑ Ctrl↑）。
+    """
+    seq = [
+        _make_key_input(VK_CONTROL, False),
+        _make_key_input(VK_C, False),
+        _make_key_input(VK_C, True),
+        _make_key_input(VK_CONTROL, True),
+    ]
+    arr = (INPUT * len(seq))(*seq)
+    sent = _user32.SendInput(len(seq), ctypes.cast(arr, ctypes.POINTER(INPUT)),
+                            ctypes.sizeof(INPUT))
+    if sent != len(seq):
+        log.warning("SendInput Ctrl+C 仅投递 %d/%d 个事件", sent, len(seq))
     return sent

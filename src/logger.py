@@ -14,8 +14,8 @@ import threading
 import traceback
 from pathlib import Path
 
-APP_NAME = "Yurun"
-YURUN_VERSION = "1.3.4"
+APP_NAME = "Yurun-Pre" if os.environ.get("YURUN_PRE") == "1" else "Yurun"
+YURUN_VERSION = "1.4.0"
 
 # 全局 Tk root 引用（由 main 在创建后注册），用于捕获 Tk 回调异常
 _tk_root = None

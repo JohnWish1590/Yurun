@@ -224,7 +224,7 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
                            resource_id: str = "volc.bigasr.sauc.duration",
                            endpoint: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
                            language: str = "auto", proxy: str = "", timeout: int = 90,
-                           hotwords=None, on_partial=None, on_timeline=None) -> str:
+                           hotwords=None, on_partial=None, on_timeline=None, on_retry=None) -> str:
     """双向流式识别（bigmodel 端点）：边录边发，边收中间结果。
 
     chunk_iter: 迭代产生 int16 PCM bytes（如 recorder.record_chunks）。
@@ -259,9 +259,17 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
         "X-Api-Connect-Id": connect_id,
     }
 
+    # 一次会话连接不会跨句复用。录音期间持续有 PCM 上行，不需要用周期性
+    # ping/pong 充当保活；那种计时器反而可能在电脑短暂卡顿时把一条仍可恢复的
+    # 长句误判为断线。这里保留本句 PCM（90 秒约 3MB），只用于最终结果丢失时
+    # 的一次完整重试，函数返回/抛错后立即释放。
+    cached_chunks = []
+    final_wait_seconds = 12
+    retry_wait_seconds = 20
     state = {
         "text": "",
         "error": None,
+        "retryable": False,
         "opened": threading.Event(),
         "done": threading.Event(),
         "first_partial": False,
@@ -304,13 +312,16 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
             state["done"].set()
 
     def _on_error(ws, error):
-        state["error"] = str(error)
+        if not state["error"]:
+            state["error"] = str(error)
+            state["retryable"] = True
         state["done"].set()
 
     def _on_close(ws, *args):
         # 网络中断时可能已经收到 partial；它不能伪装成完整识别结果并被输入。
         if not state["final_received"] and not state["error"]:
             state["error"] = "连接在收到最终结果前关闭"
+            state["retryable"] = True
         state["done"].set()
 
     ws = websocket.WebSocketApp(
@@ -318,7 +329,7 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
         on_open=_on_open, on_message=_on_message, on_error=_on_error, on_close=_on_close,
     )
 
-    run_kwargs = {"ping_interval": 20, "ping_timeout": 10}
+    run_kwargs = {}
     if proxy:
         run_kwargs["http_proxy_host"], run_kwargs["http_proxy_port"] = _parse_proxy(proxy)
         run_kwargs["proxy_type"] = "http"
@@ -334,21 +345,37 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
         raise RuntimeError("SAUC 连接超时")
 
     try:
-        # 边录边发：录音线程持续发音频块，on_message 线程持续收中间结果（防缓冲区积压）
+        # 边录边发，并完整保留本句音频。若传输中途断开，仍继续录到松手，
+        # 这样才有一份完整音频能在随后安全重试。
+        send_failed = False
         first_chunk = True
         for chunk in chunk_iter:
+            cached_chunks.append(chunk)
             if first_chunk:
                 _t("T2")  # 第一包 PCM
                 first_chunk = False
-            ws.send(_build_audio_packet(chunk, is_last=False), opcode=0x2)
+            if send_failed or state["error"]:
+                send_failed = True
+                continue
+            try:
+                ws.send(_build_audio_packet(chunk, is_last=False), opcode=0x2)
+            except Exception as exc:
+                state["error"] = str(exc)
+                state["retryable"] = True
+                send_failed = True
         _t("T4")  # 最后包 PCM（松手）
-        ws.send(_build_audio_packet(b"", is_last=True), opcode=0x2)
-        _t("T5")  # 发 FLAG_LAST
-        # 松手后等最终结果（FLAG_LAST）：完整不漏字。bigmodel 端点边听边识别，
-        # 松手后最终结果已经很快（真实场景约 0.6~1s），无需冒险用中间结果
-        # （中间结果缺最后一段音频的识别，会漏掉松手前最后 1 秒的话）。
-        if not state["done"].wait(timeout=timeout):
-            state["error"] = "识别超时"
+        if not send_failed and not state["error"]:
+            try:
+                ws.send(_build_audio_packet(b"", is_last=True), opcode=0x2)
+                _t("T5")  # 发 FLAG_LAST
+                # 只在松手后等待最终结果。12 秒足够覆盖正常收尾，也不会让真正
+                # 断线时的用户无谓等待 90 秒。
+                if not state["done"].wait(timeout=final_wait_seconds):
+                    state["error"] = "最终结果等待超时"
+                    state["retryable"] = True
+            except Exception as exc:
+                state["error"] = str(exc)
+                state["retryable"] = True
     finally:
         try:
             ws.close(timeout=0.2)
@@ -356,8 +383,70 @@ def sauc_transcribe_stream(chunk_iter, api_key: str,
             pass
     _t("T7")  # 关闭
 
+    if state["error"] and state["retryable"] and cached_chunks:
+        first_error = state["error"]
+        log.warning("SAUC 最终结果未到，准备完整音频重试一次: reason=%s chunks=%s",
+                    first_error, len(cached_chunks))
+        if on_retry:
+            try:
+                on_retry(first_error)
+            except Exception:
+                pass
+        try:
+            return _sauc_transcribe_cached_pcm(
+                cached_chunks, api_key, resource_id, endpoint, language, proxy,
+                hotwords, timeout=retry_wait_seconds,
+            )
+        except Exception as retry_error:
+            raise RuntimeError(
+                f"SAUC 错误: 初次连接失败({first_error})；一次重试仍失败({retry_error})"
+            ) from retry_error
     if state["error"]:
         raise RuntimeError(f"SAUC 错误: {state['error']}")
     if not state["final_received"]:
         raise RuntimeError("SAUC 错误: 未收到最终识别结果")
     return state["text"].strip()
+
+
+def _sauc_transcribe_cached_pcm(chunks, api_key, resource_id, endpoint, language, proxy,
+                                hotwords, timeout: int) -> str:
+    """在全新会话重放本句缓存 PCM；只接受 FLAG_LAST，绝不输入 partial。"""
+    headers = {
+        "X-Api-Key": api_key,
+        "X-Api-Resource-Id": resource_id,
+        "X-Api-Request-Id": str(uuid.uuid4()),
+        "X-Api-Connect-Id": str(uuid.uuid4()),
+    }
+    proxy_opts = {}
+    if proxy:
+        proxy_opts["http_proxy_host"], proxy_opts["http_proxy_port"] = _parse_proxy(proxy)
+        proxy_opts["proxy_type"] = "http"
+    ws = websocket.create_connection(endpoint, header=headers, timeout=timeout, **proxy_opts)
+    try:
+        ws.send_binary(_build_full_request(language, hotwords))
+        for chunk in chunks:
+            ws.send_binary(_build_audio_packet(chunk, is_last=False))
+        ws.send_binary(_build_audio_packet(b"", is_last=True))
+        last_text = ""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("重试等待最终结果超时")
+            ws.settimeout(remaining)
+            data = ws.recv()
+            if not data:
+                continue
+            parsed = _parse_response(data)
+            if parsed.get("error"):
+                raise RuntimeError(f"{parsed.get('code')} {parsed.get('message')}")
+            if parsed.get("text"):
+                last_text = parsed["text"]
+            flags = (data[1] & 0x0F) if len(data) > 1 else 0
+            if flags & FLAG_LAST:
+                return last_text.strip()
+    finally:
+        try:
+            ws.close(timeout=0.2)
+        except Exception:
+            pass

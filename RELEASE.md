@@ -36,6 +36,13 @@
    - 至少要跑一次冻结产物启动冒烟：启动 `dist\语润.exe`，确认日志里依次出现 `语润 vX.Y.Z 启动`、`已连接高权限输入助手（能力: …）`、`系统热键已启用`、`纠错热键监听已启动`、`托盘图标已提交`。
 5. 提交源码，打标签 `git tag vx.y.z`，推送 `main` 与标签（用 token-in-URL 直连，本机没有 gh CLI 凭据）。
 6. 在 GitHub 创建 Release `vx.y.z`，正文贴 CHANGELOG 对应片段，附件**必须使用 ASCII 文件名**（中文名会被 GitHub 解析成 `default.exe`）：`Yurun-Setup-vX.Y.Z.exe`（安装包）与 `Yurun-vX.Y.Z.exe`（便携主程序）。
+   - 用 `tools/github_release.py` 一步完成建 Release + 上传附件（token 只从环境变量读，不落盘）：
+     ```
+     set GH_TOKEN=ghp_xxx
+     python tools\github_release.py v1.4.0 "语润 v1.4.0 — <标题>" release_body_v1.4.0.md dist\Yurun-Setup-v1.4.0.exe dist\Yurun-v1.4.0.exe
+     ```
+     脚本可重复执行：已存在的 Release 会复用，已上传的附件会跳过。
+   - 上传前先把中文名产物复制/改名为 ASCII 名（内容完全相同，不必重新打包）。
 
 ## 从 Preview 提升到正式版
 

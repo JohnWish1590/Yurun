@@ -12,15 +12,18 @@
 
 当前版本见 `src/logger.py` 的 `YURUN_VERSION` 与 `installer/yurun_setup.iss` 的 `MyAppVersion`，**两者必须保持一致**。
 
-## 当前发布：v1.4.0（2026-09-20）
+## 当前发布：v1.4.1（2026-09-20）
 
-- 发布内容：从 Preview 验收并入「输入控制」整轮能力。录音热键与纠错热键各自独立、都可带修饰键自定义；选中文字按热键弹出「错误纠正」窗口（默认 Alt + `）；设置界面新增热键录制控件与「录音 / 纠错」槽位切换；热键注册改用 `RegisterHotKey`，并修掉进程级窗口过程、跨线程销毁窗口、特殊键虚拟键码这三个热键真 bug；纠错在 Cindy、WorkBuddy 等以管理员权限运行的软件里也能读到选区。
-- 发布边界：不包含暂停中的 TSF 输入法实验、常驻麦克风、pre-roll、Partial 直接上屏、自动学习键盘内容或焦点策略实验。拼音候选栏仍由用户现有输入法绘制，不被语润修改。
-- 兼容性：旧配置缺少 `hotkey_modifiers` / `correction_hotkey_modifiers` 时按默认补齐（录音 = 裸反引号，纠错 = Alt + 反引号），升级后手感与原版本一致；纠错热键由 Ctrl + ` 改为 Alt + `（Cindy 侧边栏占用了前者）。
-- 发布资产：`dist/语润.exe`、`dist/YurunInputHelper.exe`、`dist/YurunHelperSetup.exe` 共同组成安装版运行组件；用户分发使用 `dist/语润-Setup-1.4.0.exe`。GitHub Release 附件使用 ASCII 副本 `Yurun-Setup-v1.4.0.exe` 与 `Yurun-v1.4.0.exe`。
-- 权限行为：安装时一次性创建登录后的高权限输入助手任务；主程序日常以普通权限运行。卸载器会先删除该任务，再移除程序和 `%APPDATA%\\Yurun` 数据。
-- 回退点：Git 标签 `stable-before-v1.4.0-promotion-20260920` 指向并入前的 v1.3.4 稳定版本；本地目录 `dist_old_v1.3.4_20260920/` 保留 v1.3.4 的全部打包产物与提升前的源码副本。
-- 遗留说明：v1.3.1、v1.3.2、v1.3.4 只打过 Git 标签，没有建过 GitHub Release（因此 v1.3.4 的产物只存在于上一行那个本地目录里）。v1.4.0 是自 v1.3.3 之后的第一个正式发布。
+- 发布内容：仅修安装器与助手安装脚本。**主程序逻辑与 v1.4.0 完全一致**，v1.4.0 的全部功能（快捷键全自定义、纠错窗口、提权助手）原样保留。
+- 修复 1：升级不再卡在「安装程序无法自动关闭所有应用程序」。安装器在 `PrepareToInstall` 里显式停掉高权限输入助手（`schtasks /End` + `taskkill /F`），不再依赖 Restart Manager —— 助手是无界面常驻进程，RM 只能发 `WM_CLOSE`、从不强杀，所以永远关不掉它，而它恰好占着安装包要替换的 `YurunInputHelper.exe`。
+- 修复 2：`input_helper_setup.py::uninstall()` 原先只删登录任务。任务只负责**启动**助手，删任务不会结束已在跑的实例 → 卸载同样卡住。现在先 `/End` + `taskkill /F` 再删任务；卸载器另在 `CurUninstallStepChanged` 里加了同样的保险。
+- 发布资产：`dist/语润-Setup-1.4.1.exe`（安装版）。GitHub Release 附件用 ASCII 副本 `Yurun-Setup-v1.4.1.exe` 与 `Yurun-v1.4.1.exe`。
+- 行为变化：升级/卸载时安装器会静默停掉后台助手（约 1 秒 + 文件复制时间），装完由 `YurunHelperSetup.exe install` 重新注册并启动。用户**不需要**再手动去任务管理器结束 `YurunInputHelper.exe`。
+- 回退点：Git 标签 `v1.4.0`；本地目录 `dist_old_v1.4.0_20260920/` 保留 v1.4.0 全部产物。
+
+### 历史（v1.4.0）
+
+- v1.4.0 是自 v1.3.3 之后的第一个正式 Release；v1.3.1、v1.3.2、v1.3.4 只打过 Git 标签、没有建过 GitHub Release。
 
 ## 发布流程（手动）
 
@@ -32,6 +35,7 @@
    - 用 Inno Setup 构建安装包 `dist/语润-Setup-x.y.z.exe`：
      `"<Inno Setup 7 安装目录>\ISCC.exe" installer\yurun_setup.iss`
      - 必须用 **Inno Setup 7**：6 的 `Languages\` 目录里没有 `ChineseSimplified.isl`，会在解析 `[Languages]` 时直接中止（engine 6.7.3 实测失败，7.1.0 通过）。
+   - ⚠️ 安装器会在 `PrepareToInstall` 里**先停掉高权限输入助手**（`schtasks /End` + `taskkill /IM YurunInputHelper.exe /F`，见 `yurun_setup.iss` 的 `[Code] StopInputHelper`）。**不要**把它换成依赖 Restart Manager 的自动关闭：助手是无界面常驻进程，RM 只能给顶层窗口发 `WM_CLOSE`、从不强杀，所以永远关不掉它，而它占着 `YurunInputHelper.exe` —— v1.4.0 就是这样每次升级都弹「安装程序无法自动关闭所有应用程序」的。
 4. 本地冒烟测试安装版（启动 banner 版本号、托盘图标、热键、单次录音、个人记忆窗口）；若包含助手，再验证普通启动的语润可向一个高权限测试程序输入。
    - 至少要跑一次冻结产物启动冒烟：启动 `dist\语润.exe`，确认日志里依次出现 `语润 vX.Y.Z 启动`、`已连接高权限输入助手（能力: …）`、`系统热键已启用`、`纠错热键监听已启动`、`托盘图标已提交`。
 5. 提交源码，打标签 `git tag vx.y.z`，推送 `main` 与标签（用 token-in-URL 直连，本机没有 gh CLI 凭据）。

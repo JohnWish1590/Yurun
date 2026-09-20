@@ -4,6 +4,45 @@
 
 ---
 
+## [1.4.1] — 2026-09-20 · 修复升级与卸载无法关闭后台助手
+
+> **发布范围**：只修安装器与助手安装脚本。主程序、录音、ASR、润色、词库、热键、纠错窗口的逻辑**一行未改**，v1.4.0 的功能与手感完全不变。
+> **涉及文件**：installer/yurun_setup.iss、src/input_helper_setup.py、src/logger.py、CHANGELOG.md、README.md、RELEASE.md
+
+### 改动点
+
+- **升级不再卡在「安装程序无法自动关闭所有应用程序」**：安装器现在在检查文件占用**之前**显式停掉高权限输入助手（`schtasks /End` + `taskkill /F`），不再把这件事交给 Restart Manager。
+- **修复卸载删不掉助手**：`uninstall()` 原先只有一句 `schtasks /Delete`。登录任务只负责**启动**助手，**删掉任务并不会结束已经在跑的实例**，而助手一直占着自己的 exe 文件 —— 所以卸载同样会卡住。现在先 `schtasks /End` + `taskkill /F` 停掉进程，再删除任务。
+- **卸载器也加上了同一道保险**：`CurUninstallStepChanged` 在 `usAppMutexCheck` / `usUninstall` 两个时点都会停一次助手，即使 `YurunHelperSetup.exe` 缺失或损坏也能走通。
+
+### 背景：为什么必须绕过 Restart Manager
+
+Inno Setup 的「自动关闭应用程序」用的是 Windows Restart Manager，而 Restart Manager **只能给顶层窗口发 `WM_CLOSE`，从不强杀进程**。
+
+高权限输入助手是个**无界面的常驻服务**：它唯一的窗口来自 `hotkey.py`（`CreateWindowExW(..., style=0, ...)`，不可见），而且那个窗口即使被销毁，主线程仍阻塞在 socket 循环里，进程照旧存活。结果就是 Restart Manager 永远关不掉它：
+
+```
+pid=35436  YurunInputHelper.exe  C:\Program Files\语润\YurunInputHelper.exe   ← 唯一在跑的语润进程
+```
+
+而它恰好就是安装包 `[Files]` 要替换的三个文件之一。所以 v1.4.0 的安装包在这一步**必然**弹框，且弹框里的「重试」**永远不会成功**——助手不会自己退出。
+
+`PrepareToInstall` 是 Inno 官方用来「shutdown any application which is about to be updated」的钩子，且文档明确说明它**在 Setup 检查文件占用之前**执行，因此停在这个位置就不会再触发那个弹框。
+
+### 验证
+
+- `py_compile` 通过（`src/input_helper_setup.py`）。
+- Inno Setup 7 编译通过，`[Code]` 段为真编译（语法错误会在编译期直接失败）。
+- 冻结产物启动冒烟：启动 `dist/语润.exe`，日志确认 `语润 v1.4.1 启动`、`已连接高权限输入助手`、`系统热键已启用`、`纠错热键监听已启动`、`托盘图标已提交`。
+- 真机验收：直接运行安装包（**无需手动结束任何进程**）应一次装完，不再出现「选择操作」对话框。
+
+### 行为变化
+
+- 升级与卸载时，安装器会静默停掉后台助手，装完由 `YurunHelperSetup.exe install` 重新注册并启动。用户在安装过程中**不需要**再手动去任务管理器结束 `YurunInputHelper.exe`。
+- 助手在安装窗口期短暂缺席（约 1 秒 + 文件复制时间），期间语润无法向提权软件输入文字；安装完成后自动恢复。
+
+---
+
 ## [1.4.0] — 2026-09-20 · 快捷键全自定义与纠错窗口
 
 > **发布范围**：从 Preview 验收并入的一整轮「输入控制」能力。录音热键与纠错热键各自独立、都可带修饰键自定义；选中文字可弹出「错误纠正」窗口；设置界面新增热键录制控件与录音 / 纠错槽位切换。同时修掉三个热键真 bug，并让纠错在 Cindy、WorkBuddy 这类以管理员权限运行的软件里也能读到选区。未纳入暂停中的 TSF 输入法实验、常驻麦克风、pre-roll、Partial 直接上屏，也没有引入自动学习键盘内容或焦点策略实验。

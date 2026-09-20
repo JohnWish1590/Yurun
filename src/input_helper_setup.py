@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 TASK_NAME = "Yurun Input Helper"
@@ -50,6 +51,20 @@ def install() -> int:
 
 
 def uninstall() -> int:
+    """停止正在运行的助手，并删除登录任务。
+
+    只删任务是不够的：任务负责**启动**助手，删掉任务并不会结束已经在跑的
+    实例。而助手进程一直占着自己那个 exe 文件，于是卸载时
+    `C:\\Program Files\\<产品目录>\\YurunInputHelper.exe` 删不掉，
+    安装器会卡在"无法自动关闭所有应用程序"（Restart Manager 对无界面进程
+    无效，它只会给顶层窗口发 WM_CLOSE，从不强杀）。
+    """
+    subprocess.run(["schtasks", "/End", "/TN", TASK_NAME], capture_output=True,
+                   text=True, encoding="utf-8", errors="replace")
+    subprocess.run(["taskkill", "/IM", "YurunInputHelper.exe", "/F"], capture_output=True,
+                   text=True, encoding="utf-8", errors="replace")
+    time.sleep(0.8)
+
     deleted = subprocess.run(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"], capture_output=True,
                              text=True, encoding="utf-8", errors="replace")
     if deleted.returncode != 0:

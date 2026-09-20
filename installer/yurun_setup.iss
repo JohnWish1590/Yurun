@@ -2,7 +2,7 @@
 ; 标准安装 + 彻底卸载（清 AppData/Yurun 目录，不含开机自启）
 
 #define MyAppName "语润"
-#define MyAppVersion "1.4.0"
+#define MyAppVersion "1.4.1"
 #define MyAppPublisher "语润"
 #define MyAppExeName "语润.exe"
 
@@ -47,3 +47,47 @@ Filename: "{app}\YurunHelperSetup.exe"; Parameters: "uninstall"; Flags: runhidde
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{userappdata}\Yurun"
+
+[Code]
+const
+  HELPER_TASK = 'Yurun Input Helper';
+
+{ Stop the elevated input helper before Setup touches its files.
+
+  Why this is not left to Inno's "close applications" step: that step uses the
+  Restart Manager API, which can only ask an application to quit by sending
+  WM_CLOSE to its top-level windows -- it never terminates a process. The
+  helper is a windowless background process (its only window comes from
+  hotkey.py and has style 0, and destroying it leaves the socket main loop
+  running), so Restart Manager can never shut it down. Every upgrade therefore
+  ended in "Setup was unable to automatically close all applications", with a
+  Retry that could never succeed.
+
+  PrepareToInstall is documented to run before Setup performs that check, so
+  stopping the helper here means the check finds nothing left to close.
+  schtasks /End and taskkill are both no-ops when the helper is not running. }
+procedure StopInputHelper();
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{cmd}'),
+       '/C schtasks /End /TN "' + HELPER_TASK + '" >NUL 2>&1' +
+       ' & taskkill /IM YurunInputHelper.exe /F >NUL 2>&1',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(800);  { let Windows release the image file handle before we copy over it }
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopInputHelper();
+  Result := '';
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  { The uninstaller needs the same treatment: usAppMutexCheck runs before its
+    files-in-use check, usUninstall is a second chance in case the step order
+    ever differs. }
+  if CurUninstallStep in [usAppMutexCheck, usUninstall] then
+    StopInputHelper();
+end;

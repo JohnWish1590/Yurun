@@ -83,6 +83,25 @@ def _make_key_input(vk: int, up: bool) -> INPUT:
     return inp
 
 
+def _character_inputs(ch: str) -> list[INPUT]:
+    """Build key events for one Python character as UTF-16 code units."""
+    if ch in ("\n", "\r"):
+        return [_make_key_input(VK_RETURN, False), _make_key_input(VK_RETURN, True)]
+    encoded = ch.encode("utf-16-le", "surrogatepass")
+    units = [int.from_bytes(encoded[i:i + 2], "little")
+             for i in range(0, len(encoded), 2)]
+    events = []
+    for unit in units:
+        events.extend((_make_unicode_input(unit, False),
+                       _make_unicode_input(unit, True)))
+    return events
+
+
+def input_event_count(text: str) -> int:
+    """Return the number of SendInput events required for text."""
+    return sum(len(_character_inputs(ch)) for ch in (text or ""))
+
+
 def type_text(text: str, chunk_pause: float = 0.0, char_interval: float = 0.0, on_each=None) -> int:
     """把 text 逐字符 Unicode 输入到当前焦点窗口，不碰剪贴板。
 
@@ -98,12 +117,9 @@ def type_text(text: str, chunk_pause: float = 0.0, char_interval: float = 0.0, o
         # 逐字发送，模拟人打字节奏（流式首字上屏用，避免整段瞬间蹦出）
         total = 0
         for ch in text:
-            if ch in ("\n", "\r"):
-                pair = [_make_key_input(VK_RETURN, False), _make_key_input(VK_RETURN, True)]
-            else:
-                pair = [_make_unicode_input(ord(ch), False), _make_unicode_input(ord(ch), True)]
-            arr = (INPUT * 2)(*pair)
-            sent = _user32.SendInput(2, ctypes.cast(arr, ctypes.POINTER(INPUT)), ctypes.sizeof(INPUT))
+            events = _character_inputs(ch)
+            arr = (INPUT * len(events))(*events)
+            sent = _user32.SendInput(len(events), ctypes.cast(arr, ctypes.POINTER(INPUT)), ctypes.sizeof(INPUT))
             total += sent
             if on_each:
                 try:
@@ -114,13 +130,7 @@ def type_text(text: str, chunk_pause: float = 0.0, char_interval: float = 0.0, o
         return total
     inputs = []
     for ch in text:
-        if ch in ("\n", "\r"):
-            inputs.append(_make_key_input(VK_RETURN, False))
-            inputs.append(_make_key_input(VK_RETURN, True))
-        else:
-            code = ord(ch)
-            inputs.append(_make_unicode_input(code, False))
-            inputs.append(_make_unicode_input(code, True))
+        inputs.extend(_character_inputs(ch))
 
     # 一次性批量发送（SendInput 单次可处理大量事件，200 字 < 50ms）
     # 关键：用 cast(arr, POINTER(INPUT)) 转成 LP_INPUT；直接 byref 或传数组名会因类型不匹配抛

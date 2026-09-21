@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 from logger import get_logger
@@ -83,19 +84,31 @@ class Config:
                         self.data["input_mode"] = "direct"
                     if "input_mode" not in saved:
                         self.save()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("配置文件读取失败，继续使用默认值: %s", exc)
 
     def save(self):
         p = config_path()
-        p.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = json.dumps(self.data, ensure_ascii=False, indent=2) + "\n"
+        with _save_lock:
+            _atomic_write(p, payload)
+        return True
 
     def get(self, key, default=None):
         return self.data.get(key, default if default is not None else DEFAULTS.get(key))
 
     def set(self, key, value):
+        old_value = self.data.get(key)
+        had_value = key in self.data
         self.data[key] = value
-        self.save()
+        try:
+            self.save()
+        except Exception:
+            if had_value:
+                self.data[key] = old_value
+            else:
+                self.data.pop(key, None)
+            raise
 
     def __getitem__(self, key):
         return self.get(key)
@@ -106,6 +119,25 @@ class Config:
 
 # 全局单例
 _config = None
+_save_lock = threading.Lock()
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write a complete config before replacing the live file."""
+    temp_path = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def get_config() -> Config:
     global _config
     if _config is None:

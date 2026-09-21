@@ -32,18 +32,18 @@ python src/main.py
 ## 5. 打包独立 EXE
 
 ```powershell
-pyinstaller Yurun.spec --noconfirm
+python -m PyInstaller Yurun.spec --noconfirm
 # 产物 dist/语润.exe（onefile，内联 prompts/ 与 assets/）
 ```
 
-> 注：`--clean` 在部分开启安全删除拦截的环境会被拦截（内部删除被拦），可省略；旧构建残留用 `rm -rf build dist` 手动清理后重建。
+> 注：`--clean` 不是必须项；发布前应清理本地旧的 `build/` 与 `dist/` 生成物，但这些目录不提交到 Git。
 
 ## 6. 打包安装包（可选）
 
 先有 `dist/语润.exe`，再：
 
 ```powershell
-& "C:\Users\<你>\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer/yurun_setup.iss
+& "$env:LOCALAPPDATA\Programs\Inno Setup 7\ISCC.exe" installer/yurun_setup.iss
 # 产物 dist/语润-Setup-x.y.z.exe（含中文、桌面快捷方式、干净卸载）
 ```
 

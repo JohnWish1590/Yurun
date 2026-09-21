@@ -2,7 +2,7 @@
 ; 标准安装 + 彻底卸载（清 AppData/Yurun 目录，不含开机自启）
 
 #define MyAppName "语润"
-#define MyAppVersion "1.4.1"
+#define MyAppVersion "1.4.4"
 #define MyAppPublisher "语润"
 #define MyAppExeName "语润.exe"
 
@@ -22,6 +22,7 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+UsedUserAreasWarning=no
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
@@ -35,8 +36,8 @@ Source: "..\dist\YurunInputHelper.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\YurunHelperSetup.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\YurunHelperSetup.exe"; Parameters: "install"; Flags: runhidden waituntilterminated
@@ -52,34 +53,34 @@ Type: filesandordirs; Name: "{userappdata}\Yurun"
 const
   HELPER_TASK = 'Yurun Input Helper';
 
-{ Stop the elevated input helper before Setup touches its files.
+{ Stop the running Yurun processes before Setup touches their files.
 
   Why this is not left to Inno's "close applications" step: that step uses the
   Restart Manager API, which can only ask an application to quit by sending
   WM_CLOSE to its top-level windows -- it never terminates a process. The
-  helper is a windowless background process (its only window comes from
-  hotkey.py and has style 0, and destroying it leaves the socket main loop
-  running), so Restart Manager can never shut it down. Every upgrade therefore
-  ended in "Setup was unable to automatically close all applications", with a
-  Retry that could never succeed.
+  Yurun main window is withdrawn and the helper is a windowless background
+  process, so Restart Manager cannot reliably shut either one down. Every
+  upgrade would otherwise risk ending in "Setup was unable to automatically
+  close all applications".
 
   PrepareToInstall is documented to run before Setup performs that check, so
-  stopping the helper here means the check finds nothing left to close.
-  schtasks /End and taskkill are both no-ops when the helper is not running. }
-procedure StopInputHelper();
+  stopping both processes here means the check finds nothing left to close.
+  schtasks /End and taskkill are no-ops when the old version is not running. }
+procedure StopYurunProcesses();
 var
   ResultCode: Integer;
 begin
   Exec(ExpandConstant('{cmd}'),
        '/C schtasks /End /TN "' + HELPER_TASK + '" >NUL 2>&1' +
-       ' & taskkill /IM YurunInputHelper.exe /F >NUL 2>&1',
+       ' & taskkill /IM YurunInputHelper.exe /F >NUL 2>&1' +
+       ' & taskkill /IM "语润.exe" /F >NUL 2>&1',
        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(800);  { let Windows release the image file handle before we copy over it }
+  Sleep(1200);  { let Windows release image file handles before copying over them }
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  StopInputHelper();
+  StopYurunProcesses();
   Result := '';
 end;
 
@@ -89,5 +90,5 @@ begin
     files-in-use check, usUninstall is a second chance in case the step order
     ever differs. }
   if CurUninstallStep in [usAppMutexCheck, usUninstall] then
-    StopInputHelper();
+    StopYurunProcesses();
 end;

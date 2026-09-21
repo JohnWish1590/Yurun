@@ -10,9 +10,11 @@
 """
 import ctypes
 import ctypes.wintypes as wt
+import json
 import os
 import sys
 import time
+from pathlib import Path
 
 from logger import get_logger
 from config import app_data_dir
@@ -38,8 +40,8 @@ _SELF_EXE_NAME = os.path.basename(sys.executable).lower()
 _YURUN_PROCESS_NAMES = {_SELF_EXE_NAME, "python.exe", "pythonw.exe"}
 
 
-def _process_image_name(pid: int) -> str:
-    """返回 pid 对应的可执行文件名(小写)；进程不存在或取不到返回 ''。"""
+def _process_image_path(pid: int) -> str:
+    """Return the full executable path for pid, or an empty string."""
     h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFO, False, pid)
     if not h:
         return ""
@@ -47,15 +49,25 @@ def _process_image_name(pid: int) -> str:
         buf = ctypes.create_unicode_buffer(1024)
         size = wt.DWORD(1024)
         if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-            return os.path.basename(buf.value).lower()
+            return buf.value
         return ""
     finally:
         kernel32.CloseHandle(h)
 
 
+def _process_image_name(pid: int) -> str:
+    path = _process_image_path(pid)
+    return os.path.basename(path).lower() if path else ""
+
+
 def _write_pid(pid_file):
     try:
-        pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        record = {
+            "pid": os.getpid(),
+            "executable": str(Path(sys.executable).resolve()),
+            "script": str(Path(__file__).resolve()),
+        }
+        pid_file.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         log.warning("写 PID 文件失败: %s", e)
 
@@ -67,7 +79,12 @@ def kill_old_and_takeover() -> bool:
         _write_pid(pid_file)
         return False
     try:
-        old_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        raw = pid_file.read_text(encoding="utf-8").strip()
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError:
+            record = {"pid": int(raw)}
+        old_pid = int(record["pid"])
     except Exception:
         _write_pid(pid_file)
         return False
@@ -81,6 +98,23 @@ def kill_old_and_takeover() -> bool:
     if name not in _YURUN_PROCESS_NAMES:
         # PID 被别的程序回收了，不杀
         log.info("旧 PID %s 现属 %s，非 Yurun，跳过", old_pid, name)
+        _write_pid(pid_file)
+        return False
+    process_path = _process_image_path(old_pid)
+    if not process_path:
+        _write_pid(pid_file)
+        return False
+    if _IS_FROZEN:
+        if os.path.normcase(os.path.abspath(process_path)) != os.path.normcase(
+                os.path.abspath(sys.executable)):
+            log.warning("旧 PID %s 路径不同，跳过结束: %s", old_pid, process_path)
+            _write_pid(pid_file)
+            return False
+    elif os.path.normcase(os.path.abspath(record.get("script", ""))) != os.path.normcase(
+            os.path.abspath(__file__)):
+        # A legacy plain-PID file cannot prove that a python.exe belongs to
+        # Yurun, so never terminate an unrelated development interpreter.
+        log.warning("旧 PID %s 缺少匹配的 Yurun 脚本路径，跳过结束", old_pid)
         _write_pid(pid_file)
         return False
     h = kernel32.OpenProcess(PROCESS_TERMINATE, False, old_pid)
@@ -148,6 +182,13 @@ def kill_other_yurun_exe() -> int:
             name = pe.szExeFile.lower()
             pid = pe.th32ProcessID
             if name == _SELF_EXE_NAME and pid != me:
+                process_path = _process_image_path(pid)
+                if (not process_path or os.path.normcase(os.path.abspath(process_path))
+                        != os.path.normcase(os.path.abspath(sys.executable))):
+                    log.info("跳过不同路径的同名进程 PID=%s path=%s", pid, process_path)
+                    if not kernel32.Process32NextW(snap, ctypes.byref(pe)):
+                        break
+                    continue
                 h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
                 if h:
                     try:
@@ -163,4 +204,3 @@ def kill_other_yurun_exe() -> int:
     if killed:
         time.sleep(0.6)  # 等旧实例释放全局热键
     return killed
-

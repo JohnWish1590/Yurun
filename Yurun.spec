@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_dynamic_libs
+
+
+uiautomation_binaries = collect_dynamic_libs('uiautomation')
 
 main_a = Analysis(
     ['src\\main.py'],
     pathex=[],
-    binaries=[],
+    binaries=uiautomation_binaries,
     datas=[('prompts', 'prompts'), ('assets', 'assets')],
-    hiddenimports=['sounddevice', 'soundfile', 'websocket', 'pyautogui', 'pynput', 'pynput.keyboard', 'pynput.keyboard._win32', 'pystray._win32', 'PIL._tkinter_finder', 'singleinstance', 'typer', 'dictionary', 'voice_session', 'uiautomation', 'uiautomation.uiautomation', 'comtypes', 'privileged_ipc', 'privileged_helper', 'input_helper_setup'],
+    hiddenimports=['sounddevice', 'soundfile', 'websocket', 'pyautogui', 'pynput', 'pynput.keyboard', 'pynput.keyboard._win32', 'pystray._win32', 'PIL._tkinter_finder', 'singleinstance', 'typer', 'dictionary', 'voice_session', 'uiautomation', 'uiautomation.uiautomation', 'comtypes', 'privileged_ipc', 'privileged_helper', 'input_helper_setup', 'clipboard_transaction'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

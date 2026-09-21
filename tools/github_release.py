@@ -8,12 +8,12 @@ uploaded assets are skipped.
 
 Usage:
     set GH_TOKEN=ghp_xxx
-    python tools\\github_release.py v1.4.0 "语润 v1.4.0 — <title>" <body.md> <asset> [<asset> ...]
+    python tools\\github_release.py v1.4.4 "语润 v1.4.4 — <title>" <body.md> <asset>
 
 Example:
-    python tools\\github_release.py v1.4.0 "语润 v1.4.0 — 快捷键全自定义与纠错窗口" ^
-        release_body_v1.4.0.md ^
-        dist\\Yurun-Setup-v1.4.0.exe dist\\Yurun-v1.4.0.exe
+    python tools\\github_release.py v1.4.4 "语润 v1.4.4 — 纠错选区读取修复" ^
+        release_body_v1.4.4.md ^
+        dist\\Yurun-Setup-v1.4.4.exe
 
 Notes:
     * The token is read from the GH_TOKEN environment variable and never written

@@ -17,6 +17,7 @@
 3. LLM 润色词典：to_llm_text() -> context.userDictionary（长句润色参考）
 """
 import json
+import os
 import threading
 from copy import deepcopy
 from pathlib import Path
@@ -79,17 +80,28 @@ def _sanitize(data) -> list:
     return out
 
 
-def save(entries: list) -> None:
-    global _cache
-    _cache = entries
+def save(entries: list) -> bool:
+    """Atomically persist entries; return false when the change was not saved."""
     p = dict_path()
+    temp_path = p.with_name(p.name + f".{os.getpid()}.tmp")
     try:
         # 原子替换，避免异常退出时留下半个 JSON 词库。
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(p)
+        payload = json.dumps(entries, ensure_ascii=False, indent=2) + "\n"
+        with temp_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, p)
+        global _cache
+        _cache = entries
+        return True
     except Exception as e:
         log.error("词库保存失败: %s", e)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        return False
 
 
 def get_entries() -> list:
@@ -109,7 +121,7 @@ def add_entry(correct: str, wrong_text: str = "", source: str = "auto") -> dict:
         return {}
     wrong = (wrong_text or "").strip()
     with _lock:
-        entries = _load()
+        entries = deepcopy(_load())
         for e in entries:
             if e["text"] == correct:
                 e["count"] = int(e.get("count") or 0) + 1
@@ -119,7 +131,8 @@ def add_entry(correct: str, wrong_text: str = "", source: str = "auto") -> dict:
                         hit["count"] = int(hit.get("count") or 0) + 1
                     else:
                         e["aliases"].append({"text": wrong, "count": 1})
-                save(entries)
+                if not save(entries):
+                    raise OSError("词库保存失败")
                 return e
         entry = {
             "text": correct,
@@ -129,18 +142,20 @@ def add_entry(correct: str, wrong_text: str = "", source: str = "auto") -> dict:
             "enabled": True,
         }
         entries.append(entry)
-        save(entries)
+        if not save(entries):
+            raise OSError("词库保存失败")
         return entry
 
 
 def delete_entry(text: str) -> bool:
     text = (text or "").strip()
     with _lock:
-        entries = _load()
+        entries = deepcopy(_load())
         before = len(entries)
         entries = [e for e in entries if e["text"] != text]
         if len(entries) != before:
-            save(entries)
+            if not save(entries):
+                raise OSError("词库保存失败")
             return True
         return False
 
@@ -164,7 +179,7 @@ def update_entry(original_text: str, correct: str, aliases: list[str], enabled: 
             seen.add(value)
 
     with _lock:
-        entries = _load()
+        entries = deepcopy(_load())
         entry = next((e for e in entries if e["text"] == original), None)
         if entry is None:
             raise ValueError("词条不存在或已被删除")
@@ -178,25 +193,29 @@ def update_entry(original_text: str, correct: str, aliases: list[str], enabled: 
             for value in clean_aliases
         ]
         entry["enabled"] = bool(enabled)
-        save(entries)
+        if not save(entries):
+            raise OSError("词库保存失败")
         return deepcopy(entry)
 
 
 def set_enabled(text: str, enabled: bool) -> bool:
     """启用或停用一条记忆；停用后不会再参与任何自动使用通道。"""
     with _lock:
-        entry = next((e for e in _load() if e["text"] == (text or "").strip()), None)
+        entries = deepcopy(_load())
+        entry = next((e for e in entries if e["text"] == (text or "").strip()), None)
         if entry is None:
             return False
         entry["enabled"] = bool(enabled)
-        save(_load())
+        if not save(entries):
+            raise OSError("词库保存失败")
         return True
 
 
 def clear_entries() -> None:
     """清空全部本地记忆；界面调用前必须已获得用户明确确认。"""
     with _lock:
-        save([])
+        if not save([]):
+            raise OSError("词库保存失败")
 
 
 def to_hotwords(max_tokens: int = HOTWORDS_TOKEN_BUDGET) -> list:

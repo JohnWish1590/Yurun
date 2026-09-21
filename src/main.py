@@ -135,6 +135,7 @@ install_crash_handler()
 log_startup_banner()
 
 APP_TITLE = "语润"
+TYPE_BATCH_CHARS = 32
 
 
 class App:
@@ -154,6 +155,11 @@ class App:
         # 可选高权限输入助手。存在时只由助手接收主热键和执行输入；
         # 不可用时完整回退到当前单进程热键路径。
         self.privileged_bridge = None
+        self._local_hotkey_active = False
+        self._privileged_health_busy = False
+        self._privileged_health_lock = threading.Lock()
+        self._privileged_health_stop = threading.Event()
+        self._last_helper_wake = 0.0
         # 纠错热键（默认 Alt + 反引号，可在设置里自定义）：首选 RegisterHotKey
         # 监听器，注册失败才回退下面的 pynput 钩子状态。
         self._correct_hotkey = None
@@ -169,6 +175,7 @@ class App:
         # 必须在任何退出路径（确认/取消/重建/异常）下还原。
         self._correction_clip_armed = False
         self._correction_clip_backup = None
+        self._correction_clip_sequence = None
         # 代际计数：窗口被新窗口取代后，旧窗口已排队的回调（80ms 剪贴板读取、
         # 220ms 重新置顶）不得再执行，否则会误消费新窗口的剪贴板事务。
         self._correction_gen = 0
@@ -459,6 +466,14 @@ class App:
                 self._show_correction_dialog(evt[1] if len(evt) > 1 else None)
             elif kind == "bridge_hotkey":
                 self._handle_privileged_hotkey(evt[1] if len(evt) > 1 else {})
+            elif kind == "bridge_event":
+                event = evt[1] if len(evt) > 1 else {}
+                if event.get("event") == "connection_lost":
+                    self._handle_privileged_bridge_lost(event.get("_bridge"))
+            elif kind == "bridge_lost":
+                self._handle_privileged_bridge_lost(evt[1] if len(evt) > 1 else None)
+            elif kind == "bridge_connected":
+                self._adopt_privileged_bridge(evt[1] if len(evt) > 1 else None)
             elif kind == "model_loading":
                 pass  # 仅本地离线模式触发，不打扰
             elif kind in ("model_ready", "model_error"):
@@ -700,14 +715,127 @@ class App:
             self._on_hold_end(_key)
 
     def _on_privileged_bridge_event(self, event):
-        """桥接线程只投递事件，由 Tk 主线程顺序创建/停止语音会话。"""
-        self.ui_q.put(("bridge_hotkey", event))
+        """桥接线程只投递事件，由 Tk 主线程处理热键和连接状态。"""
+        if event.get("event") in {"hotkey_down", "hotkey_up"}:
+            self.ui_q.put(("bridge_hotkey", event))
+        else:
+            self.ui_q.put(("bridge_event", event))
 
     def _handle_privileged_hotkey(self, event):
         if event.get("event") == "hotkey_down":
             self._on_hold_start(None, helper_event=event)
         elif event.get("event") == "hotkey_up":
             self._on_hold_end(None)
+
+    def _start_local_hotkey(self):
+        """Start the normal-permission fallback exactly once."""
+        if self._local_hotkey_active or self._quit:
+            return
+        ok = self.hotkey.start(self.cfg.get("hotkey"),
+                               self.cfg.get("trigger_mode", "hold"),
+                               int(self.cfg.get("hotkey_modifiers") or 0))
+        self._local_hotkey_active = bool(ok)
+        if not ok:
+            self.ui_q.put(("toast", "热键无效"))
+
+    def _stop_local_hotkey(self):
+        if not self._local_hotkey_active:
+            return
+        try:
+            self.hotkey.stop()
+        except Exception:
+            log.exception("停止普通权限热键失败")
+        finally:
+            self._local_hotkey_active = False
+
+    def _handle_privileged_bridge_lost(self, bridge=None):
+        """Drop a dead helper and keep ordinary windows usable."""
+        if bridge is not None and bridge is not self.privileged_bridge:
+            bridge.close()
+            return
+        old = self.privileged_bridge
+        self.privileged_bridge = None
+        if old is not None:
+            old.close()
+        # A helper hotkey-up event cannot arrive after a disconnect. Stop the
+        # active recording explicitly so the next fallback hotkey starts clean.
+        active = self._sessions.get(self._recording_session_id)
+        if active and active.helper_session_id:
+            active.stop_event.set()
+            self._recording_session_id = None
+            self.ui_q.put(("error", "高权限输入助手已断开" , active.round_id))
+        self._start_local_hotkey()
+        self.ui_q.put(("toast", "高权限输入助手已断开，正在恢复"))
+
+    def _adopt_privileged_bridge(self, bridge):
+        if self._quit:
+            bridge.close()
+            return
+        if self._recording_session_id is not None:
+            # Do not change the input authority in the middle of a recording.
+            bridge.close()
+            return
+        old = self.privileged_bridge
+        self.privileged_bridge = bridge
+        if old is not None and old is not bridge:
+            old.close()
+        self._stop_local_hotkey()
+        log.info("高权限输入助手已恢复，已切回助手热键")
+        self.ui_q.put(("toast", "高权限输入助手已恢复"))
+
+    def _wake_privileged_helper(self):
+        """Ask the installed scheduled task to start the helper, at most once per 30s."""
+        now = time.monotonic()
+        if now - self._last_helper_wake < 30.0:
+            return
+        self._last_helper_wake = now
+        try:
+            import subprocess
+            from input_helper_setup import TASK_NAME
+            result = subprocess.run(
+                ["schtasks", "/Run", "/TN", TASK_NAME],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=5,
+            )
+            if result.returncode != 0:
+                log.debug("唤醒高权限输入助手失败: %s", result.stderr or result.stdout)
+        except Exception as exc:
+            log.debug("请求启动高权限输入助手失败: %s", exc)
+
+    def _privileged_health_tick(self):
+        if self._quit or self._privileged_health_stop.is_set():
+            return
+        self.root.after(5000, self._privileged_health_tick)
+        with self._privileged_health_lock:
+            if self._privileged_health_busy:
+                return
+            self._privileged_health_busy = True
+
+        def check():
+            try:
+                bridge = self.privileged_bridge
+                if bridge is not None and bridge.connected:
+                    if bridge.request("ping", timeout=0.5) is None:
+                        self.ui_q.put(("bridge_lost", bridge))
+                    return
+                self._wake_privileged_helper()
+                # The task starts asynchronously; a short delay avoids racing
+                # the helper's bind when reconnecting after a crash.
+                time.sleep(0.5)
+                candidate = PrivilegedBridge(on_event=self._on_privileged_bridge_event)
+                if candidate.connect(timeout=0.6):
+                    self.ui_q.put(("bridge_connected", candidate))
+                else:
+                    candidate.close()
+            finally:
+                with self._privileged_health_lock:
+                    self._privileged_health_busy = False
+
+        from privileged_ipc import PrivilegedBridge
+        threading.Thread(target=check, daemon=True, name="yurun-helper-health").start()
+
+    def _start_privileged_health_monitor(self):
+        self.root.after(5000, self._privileged_health_tick)
 
     def _on_correct_key(self, _key):
         """纠错热键（左 Alt + 反引号）触发：转主线程弹「错误纠正」框。"""
@@ -809,22 +937,42 @@ class App:
             return None
 
     def _clipboard_backup(self):
-        """读当前剪贴板文本（用户原内容），失败返回 None。"""
+        """备份当前剪贴板的原生格式，失败返回 None。"""
         try:
-            return self.root.clipboard_get()
-        except Exception:
-            return None
+            from clipboard_transaction import capture_clipboard
+            snapshot = capture_clipboard()
+            if snapshot is not None:
+                return snapshot
+        except Exception as exc:
+            log.warning("原生剪贴板备份不可用: %s", exc)
+        return None
 
-    def _clipboard_restore(self, backup):
-        """把备份的原剪贴板内容写回去，避免污染用户剪贴板（方案A）。"""
+    def _clipboard_restore(self, backup, expected_sequence=None):
+        """Restore text only while the clipboard is still owned by this flow.
+
+        A delayed restore must never overwrite content copied by the user after
+        the correction action started.  Full-format clipboard preservation is a
+        separate Windows integration task; this guard protects the more severe
+        race in the current text fallback.
+        """
         if backup is None:
-            return
+            return False
+        if expected_sequence is not None:
+            current_sequence = _clipboard_sequence()
+            if (current_sequence is not None
+                    and current_sequence != expected_sequence):
+                log.info("用户已更新剪贴板，跳过纠错内容还原")
+                return False
         try:
+            from clipboard_transaction import ClipboardSnapshot, restore_clipboard
+            if isinstance(backup, ClipboardSnapshot):
+                return restore_clipboard(backup)
             self.root.clipboard_clear()
             self.root.clipboard_append(backup)
             self.root.update()
+            return True
         except Exception:
-            pass
+            return False
 
     def _send_ctrl_c(self):
         """向当前焦点窗口发 Ctrl+C，把选中文本送入剪贴板。"""
@@ -865,6 +1013,10 @@ class App:
         if not correct or not target_hwnd:
             return False
         backup = self._clipboard_backup()
+        if backup is None:
+            log.warning("无法安全备份剪贴板，取消纠错替换")
+            return False
+        owned_sequence = None
         try:
             # 这是纠正操作本身的必要聚焦，不属于录音/插入流程的焦点策略。
             if _user32.GetForegroundWindow() != target_hwnd:
@@ -872,28 +1024,38 @@ class App:
             self.root.clipboard_clear()
             self.root.clipboard_append(correct)
             self.root.update()
+            owned_sequence = _clipboard_sequence()
             import pyautogui
             pyautogui.hotkey("ctrl", "v")
             # Ctrl+V 消费完内容后再恢复，既不污染剪贴板也不打断替换。
-            self.root.after(180, lambda: self._clipboard_restore(backup))
+            self.root.after(180, lambda: self._clipboard_restore(
+                backup, expected_sequence=owned_sequence))
             return True
         except Exception as exc:
-            self._clipboard_restore(backup)
+            self._clipboard_restore(backup, expected_sequence=owned_sequence)
             log.warning("纠正替换当前选区失败: %s", exc)
             return False
 
     def _correction_clipboard_arm(self):
         """进入纠错窗口的剪贴板事务：先记下用户原有剪贴板内容。"""
         self._correction_clip_backup = self._clipboard_backup()
-        self._correction_clip_armed = True
+        self._correction_clip_sequence = None
+        self._correction_clip_armed = self._correction_clip_backup is not None
+        if not self._correction_clip_armed:
+            log.warning("无法安全备份剪贴板，取消自动读取纠错选区")
+        return self._correction_clip_armed
 
-    def _correction_clipboard_restore(self):
+    def _correction_clipboard_restore(self, expected_sequence=None):
         """还原用户剪贴板；幂等，窗口确认/取消/重建/异常各路径都要调用。"""
         if not self._correction_clip_armed:
             return
         self._correction_clip_armed = False
-        self._clipboard_restore(self._correction_clip_backup)
+        sequence = (expected_sequence if expected_sequence is not None
+                    else self._correction_clip_sequence)
+        self._clipboard_restore(self._correction_clip_backup,
+                                expected_sequence=sequence)
         self._correction_clip_backup = None
+        self._correction_clip_sequence = None
 
     def _correction_geometry(self, W2, H2, selection_hwnd):
         """决定纠错窗口左上角坐标，返回 (x, y, source, work_area)。
@@ -1078,6 +1240,7 @@ class App:
         # 先出现，读取在窗口可见后进行，失败时只影响“识别文本”自动填充。
         def _finish_selection_capture(seq_before, refocus=False):
             nonlocal selected_text
+            restore_sequence = None
             if my_gen != self._correction_gen:
                 # 本窗口已被新窗口取代，剪贴板事务也已由新窗口接管，
                 # 这里再动剪贴板会把新窗口的备份状态消费掉。
@@ -1090,6 +1253,7 @@ class App:
                         and seq_before == seq_after):
                     log.info("纠错选中文本未取到（剪贴板序列号未变化）")
                 else:
+                    restore_sequence = seq_after
                     _sel = self.root.clipboard_get()
                     selected_text = (_sel or "").strip()
                     if selected_text:
@@ -1103,7 +1267,7 @@ class App:
             except Exception as exc:
                 log.warning("纠错选中文本读取失败，仍保留纠错窗口: %s", exc)
             finally:
-                self._correction_clipboard_restore()
+                self._correction_clipboard_restore(restore_sequence)
             if refocus:
                 # 走的是助手置前路径：目标窗口刚被拉到前台，得把纠错窗口拉回来，
                 # 否则用户接着在「正确写法」里打字会打不进。与 220ms 的
@@ -1123,7 +1287,8 @@ class App:
             seq_before = None
             copied_by_helper = False
             try:
-                self._correction_clipboard_arm()
+                if not self._correction_clipboard_arm():
+                    return
                 seq_before = _clipboard_sequence()
                 # 首选提权助手：目标若是提权程序（Cindy 等），只有助手能把它
                 # 置前并发 Ctrl+C —— 非提权进程这两步都会被系统拦掉。
@@ -2103,37 +2268,44 @@ class App:
             self.root.after(0, self._type_step)
             return
 
-        ch = job["buffer"][0]
-        job["buffer"] = job["buffer"][1:]
+        # Send a bounded batch.  The old one-character path made normal input
+        # wait on Tk scheduling and made elevated input perform one IPC request
+        # per character.  A bound keeps target-window checks frequent without
+        # sacrificing the fast direct-input path.
+        batch = job["buffer"][:TYPE_BATCH_CHARS]
+        job["buffer"] = job["buffer"][len(batch):]
         try:
-            from typer import type_text
+            from typer import input_event_count, type_text
             session = self._sessions.get(job["round_id"])
             target_hwnd = session.target_hwnd if session else None
-            if session and session.helper_session_id and self.privileged_bridge:
+            if session and session.helper_session_id:
                 # 高权限目标由助手输入。助手会二次确认原窗口仍在前台；不满足则安全取消，
                 # 绝不写入用户后来切换到的新窗口。
-                sent = self.privileged_bridge.type_character(session.helper_session_id, ch)
+                if not self.privileged_bridge or not self.privileged_bridge.connected:
+                    self._abort_type_job(job, "privileged_helper_disconnected")
+                    return
+                sent = self.privileged_bridge.type_text(session.helper_session_id, batch)
             else:
                 # 每个队列项只回到自己录音开始时的目标窗口，不能借用最新一轮的全局目标。
                 if target_hwnd and _user32.GetForegroundWindow() != target_hwnd:
                     self._steal_focus(target_hwnd)
-                sent = type_text(ch)
-            if sent >= 2:
+                sent = type_text(batch)
+            expected = input_event_count(batch)
+            if sent >= expected:
                 self._record_first_insert(job["round_id"])
-                job["sent_chars"] += 1
+                job["sent_chars"] += len(batch)
                 if self._is_active_session(job["round_id"]):
                     self._advance_preview_progress(job["sent_chars"])
             else:
-                # 一个 Unicode 字需要 key-down + key-up 两个事件。少于两个就不能确认
-                # 该字已完整进入目标程序；此时绝不自动重试，避免重复字或半个代理对。
+                # A partial batch cannot be safely retried: some characters may
+                # already be in the target, so retrying could duplicate text.
                 self._abort_type_job(job, f"sent={sent}")
                 return
         except Exception as e:
-            log.warning("逐字 SendInput 失败: %s", e)
+            log.warning("批量 SendInput 失败: %s", e)
             self._abort_type_job(job, "exception")
             return
-        # 删字不再绑定打字步（那样会和打字同速，显得"一下没"）；
-        # 改由独立的慢速定时器（_drain_timer_step）驱动，明显慢于打字，逐字吸走可见。
+        # 删除预览仍由独立的慢速定时器驱动，不拖慢文字提交。
         self.root.after(job["interval_ms"], self._type_step)
 
     def _do_paste(self, text, hide=True, replace=False, round_id=None):
@@ -2224,6 +2396,7 @@ class App:
     def _on_quit(self):
         log.info("用户退出")
         self._quit = True
+        self._privileged_health_stop.set()
         try:
             if self.privileged_bridge:
                 self.privileged_bridge.close()
@@ -2338,11 +2511,8 @@ class App:
         except Exception as exc:
             log.debug("高权限输入助手连接跳过: %s", exc)
         if self.privileged_bridge is None:
-            ok = self.hotkey.start(self.cfg.get("hotkey"),
-                                   self.cfg.get("trigger_mode", "hold"),
-                                   int(self.cfg.get("hotkey_modifiers") or 0))
-            if not ok:
-                self.ui_q.put(("toast", "热键无效"))
+            self._start_local_hotkey()
+        self._start_privileged_health_monitor()
         # 纠错热键：默认 Alt + 反引号（可在设置里自定义）—— 首选 RegisterHotKey
         # （理由与实测数据见 _start_correct_hotkey 的注释：提权前台窗口下钩子
         # _start_correct_hotkey 的注释：提权前台窗口下钩子收不到按键）；

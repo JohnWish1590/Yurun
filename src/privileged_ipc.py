@@ -212,11 +212,21 @@ class PrivilegedBridge:
             with self._waiters_lock:
                 self._waiters.pop(request_id, None)
 
-    def type_character(self, helper_session_id: str, text: str) -> int:
+    def type_text(self, helper_session_id: str, text: str) -> int:
+        """Ask the elevated helper to submit one text batch.
+
+        The protocol already accepts arbitrary text.  Keeping the public method
+        batch-oriented avoids turning every character into a separate IPC
+        round-trip while retaining the helper's foreground/session checks.
+        """
         reply = self.request("type", {"session_id": helper_session_id, "text": text}, timeout=0.8)
         if not reply or not reply.get("ok"):
             return 0
         return int(reply.get("sent") or 0)
+
+    def type_character(self, helper_session_id: str, text: str) -> int:
+        """Backward-compatible alias for older callers."""
+        return self.type_text(helper_session_id, text)
 
     def copy_selection(self, hwnd: int, timeout: float = 1.5) -> dict | None:
         """请助手把 hwnd 的选中文字复制进剪贴板（提权执行）。
@@ -229,6 +239,7 @@ class PrivilegedBridge:
         return self.request("copy_selection", {"hwnd": int(hwnd)}, timeout=timeout)
 
     def _read_loop(self):
+        unexpected_disconnect = False
         try:
             while self._running and self._conn is not None:
                 message = self._conn.recv()
@@ -242,6 +253,14 @@ class PrivilegedBridge:
                     self._on_event(message.get("payload") or {})
         except Exception as exc:
             if self._running:
+                unexpected_disconnect = True
                 log.warning("高权限输入助手连接已断开: %s", exc)
         finally:
             self.close()
+            if unexpected_disconnect and self._on_event:
+                try:
+                    # Keep the source object so a delayed event from an old
+                    # connection cannot tear down a newer replacement bridge.
+                    self._on_event({"event": "connection_lost", "_bridge": self})
+                except Exception:
+                    pass
